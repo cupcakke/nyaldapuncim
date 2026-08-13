@@ -119,6 +119,29 @@ fn parseOptionalEnvironmentUsize(allocator: std.mem.Allocator, name: []const u8)
     return std.fmt.parseInt(usize, owned, 10) catch return error.InvalidEnvironmentValue;
 }
 
+fn parseOptionalEnvironmentF32(allocator: std.mem.Allocator, name: []const u8) !?f32 {
+    const owned = std.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(owned);
+    if (owned.len == 0) return error.InvalidEnvironmentValue;
+    const value = std.fmt.parseFloat(f32, owned) catch return error.InvalidEnvironmentValue;
+    if (!std.math.isFinite(value)) return error.InvalidEnvironmentValue;
+    return value;
+}
+
+fn parseOptionalEnvironmentBool(allocator: std.mem.Allocator, name: []const u8) !?bool {
+    const owned = std.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(owned);
+    if (std.mem.eql(u8, owned, "1") or std.mem.eql(u8, owned, "true")) return true;
+    if (std.mem.eql(u8, owned, "0") or std.mem.eql(u8, owned, "false")) return false;
+    return error.InvalidEnvironmentValue;
+}
+
 fn loadDataset(
     allocator: std.mem.Allocator,
     coordinator: *GPUCoordinator,
@@ -902,7 +925,6 @@ pub fn main() !void {
     }
 
     var coordinator = try GPUCoordinator.init(
-        allocator,
         world_size,
         rank,
         local_rank,
@@ -1173,38 +1195,23 @@ pub fn main() !void {
         return error.InvalidConfig;
     };
 
-    const shuffle_control_string_owned: ?[]u8 = std.process.getEnvVarOwned(
-        allocator,
-        "JAIDE_SHUFFLE_TARGET_CONTROL",
-    ) catch null;
-    defer if (shuffle_control_string_owned) |owned| allocator.free(owned);
-
-    const shuffle_target_control: bool = if (shuffle_control_string_owned) |value|
-        std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "true")
-    else
-        false;
-
-    const frozen_target_string_owned: ?[]u8 = std.process.getEnvVarOwned(
-        allocator,
-        "JAIDE_TARGET_SOURCE_FROZEN",
-    ) catch null;
-    defer if (frozen_target_string_owned) |owned| allocator.free(owned);
-
-    const target_source_frozen: bool = if (frozen_target_string_owned) |value|
-        !(std.mem.eql(u8, value, "0") or std.mem.eql(u8, value, "false"))
-    else
-        true;
-
-    const depth_compensation_string_owned: ?[]u8 = std.process.getEnvVarOwned(
-        allocator,
-        "JAIDE_SPECTRAL_DEPTH_COMPENSATION",
-    ) catch null;
-    defer if (depth_compensation_string_owned) |owned| allocator.free(owned);
-
-    const spectral_depth_compensation: bool = if (depth_compensation_string_owned) |value|
-        !(std.mem.eql(u8, value, "0") or std.mem.eql(u8, value, "false"))
-    else
-        true;
+    const shuffle_target_control = (try parseOptionalEnvironmentBool(allocator, "JAIDE_SHUFFLE_TARGET_CONTROL")) orelse false;
+    const target_source_frozen = (try parseOptionalEnvironmentBool(allocator, "JAIDE_TARGET_SOURCE_FROZEN")) orelse true;
+    const spectral_depth_compensation = (try parseOptionalEnvironmentBool(allocator, "JAIDE_SPECTRAL_DEPTH_COMPENSATION")) orelse true;
+    const grad_mean = (try parseOptionalEnvironmentBool(allocator, "JAIDE_GRAD_MEAN")) orelse true;
+    const use_normalized_gradient_flow = (try parseOptionalEnvironmentBool(allocator, "JAIDE_NORMALIZED_GRADIENT_FLOW")) orelse true;
+    const spectral_target_norm = (try parseOptionalEnvironmentF32(allocator, "JAIDE_SPECTRAL_NORM_TARGET")) orelse 0.9;
+    const spectral_iterations = (try parseOptionalEnvironmentUsize(allocator, "JAIDE_SPECTRAL_POWER_ITERATIONS")) orelse 30;
+    const spectral_interval = (try parseOptionalEnvironmentUsize(allocator, "JAIDE_SPECTRAL_INTERVAL")) orelse 10;
+    const trust_ratio = (try parseOptionalEnvironmentF32(allocator, "JAIDE_SFD_TRUST_RATIO")) orelse 0.1;
+    const weight_floor = (try parseOptionalEnvironmentF32(allocator, "JAIDE_SFD_WEIGHT_FLOOR")) orelse 1e-3;
+    const gradient_clip_norm = (try parseOptionalEnvironmentF32(allocator, "JAIDE_GRADIENT_CLIP_NORM")) orelse 1.0;
+    const logdet_weight = (try parseOptionalEnvironmentF32(allocator, "JAIDE_LOGDET_WEIGHT")) orelse dtf.fused_logdet_weight_default;
+    const checkpoint_version = (try parseOptionalEnvironmentUsize(allocator, "JAIDE_CHECKPOINT_VERSION")) orelse dtf.CHECKPOINT_VERSION;
+    const seed_offset = (try parseOptionalEnvironmentUsize(allocator, "JAIDE_SEED_OFFSET")) orelse 0;
+    const embedding_seed = std.math.add(u64, 42, std.math.cast(u64, seed_offset) orelse return error.InvalidConfig) catch return error.InvalidConfig;
+    if (checkpoint_version != dtf.CHECKPOINT_VERSION) return error.InvalidConfig;
+    if (spectral_target_norm <= 0.0 or spectral_interval == 0 or trust_ratio <= 0.0 or trust_ratio > 1.0 or weight_floor <= 0.0 or gradient_clip_norm <= 0.0) return error.InvalidConfig;
 
     const dataset_path_owned: ?[]u8 = std.process.getEnvVarOwned(
         allocator,
@@ -1400,12 +1407,17 @@ pub fn main() !void {
         );
 
         var trainer_config: TrainerConfig = .{};
+        trainer_config.checkpoint_version = @intCast(checkpoint_version);
         trainer_config.learning_rate = learning_rate;
-        trainer_config.spectral_iterations = 30;
-        trainer_config.spectral_target_norm = 0.9;
+        trainer_config.embedding_seed = embedding_seed;
+        trainer_config.spectral_iterations = spectral_iterations;
+        trainer_config.spectral_target_norm = spectral_target_norm;
+        trainer_config.spectral_interval = @intCast(spectral_interval);
         trainer_config.clip_min = clip_min;
         trainer_config.clip_max = clip_max;
-        trainer_config.grad_mean = true;
+        trainer_config.grad_mean = grad_mean;
+        trainer_config.use_normalized_gradient_flow = use_normalized_gradient_flow;
+        trainer_config.gradient_clip_norm = gradient_clip_norm;
         trainer_config.reasoning_cycles = reasoning_cycles;
         trainer_config.relational_pass_interval = relational_pass_interval;
         trainer_config.reconstruction_alpha = reconstruction_alpha;
@@ -1414,6 +1426,9 @@ pub fn main() !void {
         trainer_config.shuffle_target_control = shuffle_target_control;
         trainer_config.target_source_frozen = target_source_frozen;
         trainer_config.spectral_depth_compensation = spectral_depth_compensation;
+        trainer_config.trust_ratio = trust_ratio;
+        trainer_config.weight_floor = weight_floor;
+        trainer_config.logdet_weight = logdet_weight;
 
         const components = TrainerComponents{
             .tokenizer = tokenizer,
@@ -1470,6 +1485,10 @@ pub fn main() !void {
     std.debug.print(
         "[Rank {d}] target_source_frozen={} shuffle_target_control={} spectral_depth_compensation={}\n",
         .{ rank, target_source_frozen, shuffle_target_control, spectral_depth_compensation },
+    );
+    std.debug.print(
+        "[Rank {d}] grad_mean={} normalized_gradient_flow={} gradient_clip={d} trust_ratio={d} weight_floor={d} logdet_weight={d} spectral_target={d} spectral_iterations={d} spectral_interval={d}\n",
+        .{ rank, grad_mean, use_normalized_gradient_flow, gradient_clip_norm, trust_ratio, weight_floor, logdet_weight, spectral_target_norm, spectral_iterations, spectral_interval },
     );
     std.debug.print(
         "[Rank {d}] Futhark trainer initialized with model_dim={d}, layers={d}\n",

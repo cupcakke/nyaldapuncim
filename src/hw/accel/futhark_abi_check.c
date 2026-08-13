@@ -1,4 +1,5 @@
 #include "main_gpu.h"
+#include <stdbool.h>
 #include <stdint.h>
 
 typedef int (*backward_gradients_type)(
@@ -10,6 +11,7 @@ typedef int (*backward_gradients_type)(
     const struct futhark_i64_1d *,
     const struct futhark_f16_3d *,
     const struct futhark_f16_3d *,
+    bool,
     float,
     float,
     float,

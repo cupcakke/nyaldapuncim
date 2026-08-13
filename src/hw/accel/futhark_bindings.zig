@@ -197,12 +197,13 @@ pub extern "c" fn futhark_entry_rsf_stack_backward_gradients_fused(
     in3_lengths: ?*const struct_futhark_i64_1d,
     in4_weights_s: ?*const struct_futhark_f16_3d,
     in5_weights_t: ?*const struct_futhark_f16_3d,
-    in6_gradient_scale: f32,
-    in7_clip_min: f32,
-    in8_clip_max: f32,
-    in9_reconstruction_alpha: f32,
-    in10_forward_scale: f32,
-    in11_logdet_weight: f32,
+    in6_grad_mean: bool,
+    in7_gradient_scale: f32,
+    in8_clip_min: f32,
+    in9_clip_max: f32,
+    in10_reconstruction_alpha: f32,
+    in11_forward_scale: f32,
+    in12_logdet_weight: f32,
 ) c_int;
 
 pub extern "c" fn futhark_free_opaque_tup6_arr3d_f32_arr3d_f32_arr3d_f16_f32_f32_f32(

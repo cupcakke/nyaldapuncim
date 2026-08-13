@@ -35,10 +35,11 @@ const FormalVerificationEngine = core_relational.FormalVerificationEngine;
 const SecurityProofEngine = core_relational.SecurityProofEngine;
 const QuantumTaskAdapter = core_relational.QuantumTaskAdapter;
 const QuantumSubgraph = core_relational.QuantumSubgraph;
+const checkpoint_schema = @import("../distributed/checkpoint_envelope.zig");
 
 const RESERVED_TOKEN_COUNT: usize = 4;
-const DISTRIBUTED_CHECKPOINT_MAGIC = "JAIDECKP";
-const DISTRIBUTED_CHECKPOINT_VERSION: u32 = 7;
+const DISTRIBUTED_CHECKPOINT_MAGIC = checkpoint_schema.MAGIC;
+const DISTRIBUTED_CHECKPOINT_VERSION = checkpoint_schema.VERSION;
 const MAX_DISTRIBUTED_CHECKPOINT_FILE_SIZE: u64 = 1 << 40;
 const MAX_DISTRIBUTED_MODEL_DIM: u64 = 1 << 20;
 const MAX_DISTRIBUTED_LAYER_COUNT: u64 = 1 << 20;
@@ -60,13 +61,13 @@ fn CheckpointReader(comptime ReaderType: type) type {
 
         const Self = @This();
 
-        fn readByte(self: *Self) !u8 {
+        pub fn readByte(self: *Self) !u8 {
             const byte = try self.inner.readByte();
             self.crc.update(&.{byte});
             return byte;
         }
 
-        fn readInt(self: *Self, comptime T: type, endian: std.builtin.Endian) !T {
+        pub fn readInt(self: *Self, comptime T: type, endian: std.builtin.Endian) !T {
             var bytes: [@sizeOf(T)]u8 = undefined;
             try self.inner.readNoEof(&bytes);
             self.crc.update(&bytes);
@@ -219,45 +220,19 @@ fn loadDistributedCheckpoint(allocator: Allocator, path: []const u8) !ModelForma
 
     var magic: [8]u8 = undefined;
     try reader.readNoEof(&magic);
-    if (!mem.eql(u8, magic[0..], DISTRIBUTED_CHECKPOINT_MAGIC)) return error.InvalidCheckpointMagic;
+    if (!mem.eql(u8, magic[0..], DISTRIBUTED_CHECKPOINT_MAGIC[0..])) return error.InvalidCheckpointMagic;
     if (try reader.readInt(u32, .little) != DISTRIBUTED_CHECKPOINT_VERSION) return error.UnsupportedCheckpointVersion;
-    if (try reader.readInt(u32, .little) != 0x01020304) return error.InvalidCheckpointStructure;
+    if (try reader.readInt(u32, .little) != checkpoint_schema.ENDIAN_MARKER) return error.InvalidCheckpointStructure;
 
-    _ = try reader.readInt(u64, .little);
-    const model_dim_u64 = try reader.readInt(u64, .little);
-    const layer_count_u64 = try reader.readInt(u64, .little);
-    const vocab_size_u64 = try reader.readInt(u64, .little);
-    _ = try reader.readInt(u64, .little);
-    _ = try checkpointReadF32(&reader);
-    _ = try checkpointReadF32(&reader);
-    _ = try checkpointReadF32(&reader);
-    _ = try checkpointReadF32(&reader);
-    _ = try checkpointReadF32(&reader);
-    _ = try checkpointReadF32(&reader);
-    _ = try reader.readInt(u64, .little);
-    _ = try reader.readInt(u64, .little);
-    _ = try checkpointReadF32(&reader);
-    _ = try reader.readInt(u64, .little);
-    _ = try checkpointReadF32(&reader);
-    _ = try reader.readInt(u64, .little);
-    _ = try reader.readInt(u64, .little);
-    _ = try checkpointReadF32(&reader);
-    _ = try checkpointReadF32(&reader);
-    if (try reader.readByte() > 1) return error.InvalidCheckpointStructure;
-    if (try reader.readByte() > 1) return error.InvalidCheckpointStructure;
-    _ = try reader.readInt(u64, .little);
-    _ = try reader.readInt(u64, .little);
-    _ = try reader.readInt(u64, .little);
-    _ = try reader.readInt(u64, .little);
-    if (try reader.readByte() > 1) return error.InvalidCheckpointStructure;
-    if (try reader.readByte() > 1) return error.InvalidCheckpointStructure;
-    if (try reader.readByte() > 1) return error.InvalidCheckpointStructure;
-    _ = try checkpointReadF32(&reader);
-    _ = try reader.readInt(u64, .little);
-    if (try reader.readByte() > 1) return error.InvalidCheckpointStructure;
-    const clip_min = try checkpointReadF32(&reader);
-    const clip_max = try checkpointReadF32(&reader);
-    _ = try reader.readInt(u64, .little);
+    const metadata = checkpoint_schema.readMetadata(&reader) catch |err| switch (err) {
+        error.InvalidFloat, error.InvalidBoolean => return error.InvalidCheckpointStructure,
+        else => return err,
+    };
+    const model_dim_u64 = metadata.model_dim;
+    const layer_count_u64 = metadata.layer_count;
+    const vocab_size_u64 = metadata.vocab_size;
+    const clip_min = metadata.clip_min;
+    const clip_max = metadata.clip_max;
 
     if (model_dim_u64 == 0 or model_dim_u64 > MAX_DISTRIBUTED_MODEL_DIM or model_dim_u64 % 2 != 0) return error.InvalidCheckpointModel;
     if (layer_count_u64 == 0 or layer_count_u64 > MAX_DISTRIBUTED_LAYER_COUNT) return error.InvalidCheckpointModel;
@@ -352,7 +327,7 @@ fn loadDistributedCheckpoint(allocator: Allocator, path: []const u8) !ModelForma
     errdefer tokenizer_ptr.deinit();
     try tokenizer_ptr.loadVocab(tokenizer_path);
     if (tokenizer_ptr.vocabSize() != vocab_size) return error.InvalidCheckpointVocabulary;
-    if (try reader.readInt(u32, .little) != 0xDEADBEEF) return error.InvalidCheckpointTrailer;
+    if (try reader.readInt(u32, .little) != checkpoint_schema.TRAILER) return error.InvalidCheckpointTrailer;
     if (reader.crc.final() != try reader.inner.readInt(u32, .little)) return error.CheckpointChecksumMismatch;
     _ = reader.inner.readByte() catch |err| {
         if (err != error.EndOfStream) return err;
@@ -369,7 +344,7 @@ fn isDistributedCheckpoint(path: []const u8) !bool {
     var magic: [8]u8 = undefined;
     const bytes_read = file.read(&magic) catch return error.InvalidCheckpointStructure;
     if (bytes_read != magic.len) return false;
-    return mem.eql(u8, magic[0..], DISTRIBUTED_CHECKPOINT_MAGIC);
+    return mem.eql(u8, magic[0..], DISTRIBUTED_CHECKPOINT_MAGIC[0..]);
 }
 
 pub const ServerConfig = struct {

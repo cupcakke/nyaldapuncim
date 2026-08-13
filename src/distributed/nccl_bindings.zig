@@ -50,54 +50,11 @@ pub extern fn ncclGetUniqueId(uniqueId: *ncclUniqueId) ncclResult_t;
 pub extern fn ncclCommInitRank(comm: **ncclComm, nranks: c_int, commId: ncclUniqueId, rank: c_int) ncclResult_t;
 pub extern fn ncclCommDestroy(comm: *ncclComm) ncclResult_t;
 pub extern fn ncclCommFinalize(comm: *ncclComm) ncclResult_t;
-pub extern fn ncclCommCount(comm: *const ncclComm, count: *c_int) ncclResult_t;
-pub extern fn ncclCommCuDevice(comm: *const ncclComm, device: *c_int) ncclResult_t;
-pub extern fn ncclCommUserRank(comm: *const ncclComm, rank: *c_int) ncclResult_t;
 
 pub extern fn ncclAllReduce(
     sendbuff: ?*const anyopaque,
     recvbuff: ?*anyopaque,
     count: usize,
-    datatype: ncclDataType_t,
-    op: ncclRedOp_t,
-    comm: *ncclComm,
-    stream: ?*anyopaque,
-) ncclResult_t;
-
-pub extern fn ncclBroadcast(
-    sendbuff: ?*const anyopaque,
-    recvbuff: ?*anyopaque,
-    count: usize,
-    datatype: ncclDataType_t,
-    root: c_int,
-    comm: *ncclComm,
-    stream: ?*anyopaque,
-) ncclResult_t;
-
-pub extern fn ncclReduce(
-    sendbuff: ?*const anyopaque,
-    recvbuff: ?*anyopaque,
-    count: usize,
-    datatype: ncclDataType_t,
-    op: ncclRedOp_t,
-    root: c_int,
-    comm: *ncclComm,
-    stream: ?*anyopaque,
-) ncclResult_t;
-
-pub extern fn ncclAllGather(
-    sendbuff: ?*const anyopaque,
-    recvbuff: ?*anyopaque,
-    sendcount: usize,
-    datatype: ncclDataType_t,
-    comm: *ncclComm,
-    stream: ?*anyopaque,
-) ncclResult_t;
-
-pub extern fn ncclReduceScatter(
-    sendbuff: ?*const anyopaque,
-    recvbuff: ?*anyopaque,
-    recvcount: usize,
     datatype: ncclDataType_t,
     op: ncclRedOp_t,
     comm: *ncclComm,
@@ -115,12 +72,9 @@ pub const CudaError = enum(c_int) {
 
 pub extern fn cudaGetDeviceCount(count: *c_int) CudaError;
 pub extern fn cudaSetDevice(device: c_int) CudaError;
-pub extern fn cudaGetDevice(device: *c_int) CudaError;
 pub extern fn cudaMalloc(devPtr: *?*anyopaque, size: usize) CudaError;
 pub extern fn cudaFree(devPtr: ?*anyopaque) CudaError;
 pub extern fn cudaMemcpy(dst: ?*anyopaque, src: ?*const anyopaque, count: usize, kind: c_int) CudaError;
-pub extern fn cudaMemset(devPtr: ?*anyopaque, value: c_int, count: usize) CudaError;
-pub extern fn cudaDeviceSynchronize() CudaError;
 pub extern fn cudaStreamCreate(pStream: **anyopaque) CudaError;
 pub extern fn cudaStreamDestroy(stream: *anyopaque) CudaError;
 pub extern fn cudaStreamSynchronize(stream: *anyopaque) CudaError;
@@ -132,4 +86,3 @@ pub const cudaMemcpyKind = struct {
     pub const cudaMemcpyDeviceToHost: c_int = 2;
     pub const cudaMemcpyDeviceToDevice: c_int = 3;
 };
-

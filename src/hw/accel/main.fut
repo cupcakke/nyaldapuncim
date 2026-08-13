@@ -340,6 +340,7 @@ entry rsf_stack_backward_gradients_fused [batch_size][seq_len][half][num_layers]
   (lengths: [batch_size]i64)
   (weights_s: *[num_layers][half][half+1]f16)
   (weights_t: *[num_layers][half][half+1]f16)
+  (grad_mean: bool)
   (gradient_scale: f32)
   (clip_min: f32)
   (clip_max: f32)
@@ -358,6 +359,8 @@ entry rsf_stack_backward_gradients_fused [batch_size][seq_len][half][num_layers]
   let count_elements = if valid_tokens > 0 then valid_tokens * d2 else 1
   let count_elements_f32 = f32.i64 count_elements
   let count_tokens_f32 = f32.max 1f32 (f32.i64 valid_tokens)
+  let gradient_element_divisor = if grad_mean then count_elements_f32 else 1f32
+  let gradient_token_divisor = if grad_mean then count_tokens_f32 else 1f32
   let active_indices = filter (\t ->
     let b = t / seq_len
     let j = t % seq_len
@@ -369,7 +372,7 @@ entry rsf_stack_backward_gradients_fused [batch_size][seq_len][half][num_layers]
     map2 (\yv tv ->
       let diff = f32.f16 yv - f32.f16 tv
       let safe_diff = if f32.isnan diff || f32.isinf diff then 0f32 else f32.max (-100f32) (f32.min 100f32 diff)
-      in 2f32 * safe_diff / count_elements_f32) y t) active_final active_targets
+      in 2f32 * safe_diff / gradient_element_divisor) y t) active_final active_targets
   let y_start = map (map f32.f16) active_final
   let gs_zero = replicate half (replicate (half + 1) 0f32)
   let (gs_stack, gt_stack, x_stack, g_stack, ld_stack) =
@@ -406,7 +409,7 @@ entry rsf_stack_backward_gradients_fused [batch_size][seq_len][half][num_layers]
         let scale = map f32.exp clipped
         let x1 = map2 (/) u1 scale
         let dx1 = map2 (*) dy1_total scale
-        let ld_shift = logdet_weight / count_tokens_f32
+        let ld_shift = logdet_weight / gradient_token_divisor
         let ds = map3 (\p dt_j u_j ->
           if p >= clip_min && p <= clip_max then dt_j * u_j + ld_shift else 0f32) pre_scale dy1_total u1
         let dx2 = map (\j ->
@@ -454,7 +457,7 @@ entry rsf_stack_backward_gradients_fused [batch_size][seq_len][half][num_layers]
       let base = forward_scale * gv
       let diff = xv - f32.f16 ov
       let safe_diff = if f32.isnan diff || f32.isinf diff then 0f32 else f32.max (-100f32) (f32.min 100f32 diff)
-      let combined = base + reconstruction_alpha * 2f32 * safe_diff / count_elements_f32
+      let combined = base + reconstruction_alpha * 2f32 * safe_diff / gradient_element_divisor
       in f16.f32 (f32.max (-65504f32) (f32.min 65504f32 combined))) g_row x_row o_row
     ) g_stack x_stack active_orig
   let zero_delta = replicate (batch_size * seq_len) (replicate d2 0f16)

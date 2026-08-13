@@ -1,3 +1,4 @@
+import csv
 import hashlib
 import json
 import math
@@ -93,13 +94,18 @@ SPECTRAL_NORM_TARGET = os.environ.get("JAIDE_BENCH_SPECTRAL_NORM_TARGET", "0.9")
 SPECTRAL_POWER_ITERATIONS = int(os.environ.get("JAIDE_BENCH_SPECTRAL_POWER_ITERATIONS", "30"))
 SEED_OFFSET = int(os.environ.get("JAIDE_BENCH_SEED_OFFSET", "0"))
 GRAD_MEAN = os.environ.get("JAIDE_BENCH_GRAD_MEAN", "true")
+NORMALIZED_GRADIENT_FLOW = os.environ.get("JAIDE_BENCH_NORMALIZED_GRADIENT_FLOW", "true")
+GRADIENT_CLIP_NORM = os.environ.get("JAIDE_BENCH_GRADIENT_CLIP_NORM", "1.0")
+SFD_TRUST_RATIO = os.environ.get("JAIDE_BENCH_SFD_TRUST_RATIO", "0.1")
+SFD_WEIGHT_FLOOR = os.environ.get("JAIDE_BENCH_SFD_WEIGHT_FLOOR", "0.001")
+SPECTRAL_INTERVAL = int(os.environ.get("JAIDE_BENCH_SPECTRAL_INTERVAL", "10"))
+LOGDET_WEIGHT = os.environ.get("JAIDE_BENCH_LOGDET_WEIGHT", "-0.001")
 CLIP_MIN = os.environ.get("JAIDE_BENCH_CLIP_MIN", "-5.0")
 CLIP_MAX = os.environ.get("JAIDE_BENCH_CLIP_MAX", "5.0")
 CHECKPOINT_VERSION = int(os.environ.get("JAIDE_BENCH_CHECKPOINT_VERSION", "7"))
-SAVE_VERSION = os.environ.get("JAIDE_BENCH_SAVE_VERSION", "RSF0+7")
-MAX_TOKENS = int(os.environ.get("JAIDE_BENCH_MAX_TOKENS", "128000000"))
 CHECKPOINT_INTERVAL_EPOCHS = int(os.environ.get("JAIDE_BENCH_CHECKPOINT_INTERVAL_EPOCHS", "5"))
 RESUME_CHECKPOINT = os.environ.get("JAIDE_BENCH_RESUME_CHECKPOINT", "")
+NCU_ENABLE = os.environ.get("JAIDE_BENCH_NCU", "1") == "1"
 
 app = modal.App(APP_NAME)
 
@@ -506,6 +512,42 @@ def _run_futhark_kernels(project_dir: str, env: Dict[str, str]) -> None:
     )
 
 
+def _parse_gpu_monitor(text: str) -> Dict[str, Any]:
+    samples: Dict[int, Dict[str, List[float]]] = {}
+    for row in csv.reader(text.splitlines()):
+        if len(row) != 6:
+            continue
+        try:
+            index = int(row[0].strip())
+        except ValueError:
+            continue
+        target = samples.setdefault(index, {
+            "utilization_gpu_pct": [],
+            "memory_used_mib": [],
+            "memory_total_mib": [],
+            "power_draw_w": [],
+            "clock_sm_mhz": [],
+        })
+        for key, raw_value in zip(target, row[1:]):
+            try:
+                target[key].append(float(raw_value.strip()))
+            except ValueError:
+                pass
+    result: Dict[str, Any] = {}
+    for index, metrics in samples.items():
+        result[str(index)] = {
+            key: {
+                "count": len(values),
+                "min": min(values),
+                "max": max(values),
+                "mean": sum(values) / len(values),
+            }
+            for key, values in metrics.items()
+            if values
+        }
+    return result
+
+
 @app.function(
     image=image,
     cpu=(CPU_REQUEST, CPU_LIMIT),
@@ -686,12 +728,16 @@ def run_gpu_train_and_infer(
         "spectral_power_iterations": SPECTRAL_POWER_ITERATIONS,
         "seed_offset": SEED_OFFSET,
         "grad_mean": GRAD_MEAN,
+        "normalized_gradient_flow": NORMALIZED_GRADIENT_FLOW,
+        "gradient_clip_norm": GRADIENT_CLIP_NORM,
+        "sfd_trust_ratio": SFD_TRUST_RATIO,
+        "sfd_weight_floor": SFD_WEIGHT_FLOOR,
+        "spectral_interval": SPECTRAL_INTERVAL,
+        "logdet_weight": LOGDET_WEIGHT,
         "clip_min": CLIP_MIN,
         "clip_max": CLIP_MAX,
-        "max_tokens": MAX_TOKENS,
         "checkpoint_path": CHECKPOINT_PATH,
         "checkpoint_version": CHECKPOINT_VERSION,
-        "save_version": SAVE_VERSION,
         "reasoning_cycles": REASONING_CYCLES,
         "relational_pass_interval": RELATIONAL_PASS_INTERVAL,
         "phases": {},
@@ -757,20 +803,24 @@ def run_gpu_train_and_infer(
         train_env["JAIDE_MAX_SAMPLES"] = str(min(sample_count, SAMPLE_CAP))
         train_env["JAIDE_MAX_SEQ_LEN"] = str(MAX_SEQ_LEN)
         train_env["JAIDE_LEARNING_RATE"] = LEARNING_RATE
-        train_env["JAIDE_MAX_TOKENS"] = str(MAX_TOKENS)
         train_env["JAIDE_VOCAB_SIZE"] = str(VOCAB_SIZE)
         train_env["JAIDE_TOKENIZER_VOCAB"] = CHECKPOINT_PATH
         train_env["JAIDE_SPECTRAL_NORM_TARGET"] = SPECTRAL_NORM_TARGET
         train_env["JAIDE_SPECTRAL_POWER_ITERATIONS"] = str(SPECTRAL_POWER_ITERATIONS)
         train_env["JAIDE_SEED_OFFSET"] = str(SEED_OFFSET)
         train_env["JAIDE_GRAD_MEAN"] = GRAD_MEAN
+        train_env["JAIDE_NORMALIZED_GRADIENT_FLOW"] = NORMALIZED_GRADIENT_FLOW
+        train_env["JAIDE_GRADIENT_CLIP_NORM"] = GRADIENT_CLIP_NORM
+        train_env["JAIDE_SFD_TRUST_RATIO"] = SFD_TRUST_RATIO
+        train_env["JAIDE_SFD_WEIGHT_FLOOR"] = SFD_WEIGHT_FLOOR
+        train_env["JAIDE_SPECTRAL_INTERVAL"] = str(SPECTRAL_INTERVAL)
+        train_env["JAIDE_LOGDET_WEIGHT"] = LOGDET_WEIGHT
         train_env["JAIDE_CLIP_MIN"] = CLIP_MIN
         train_env["JAIDE_CLIP_MAX"] = CLIP_MAX
         train_env["JAIDE_CHECKPOINT_VERSION"] = str(CHECKPOINT_VERSION)
         train_env["JAIDE_CHECKPOINT_INTERVAL_EPOCHS"] = str(CHECKPOINT_INTERVAL_EPOCHS)
         if RESUME_CHECKPOINT:
             train_env["JAIDE_RESUME_CHECKPOINT"] = RESUME_CHECKPOINT
-        train_env["JAIDE_SAVE_VERSION"] = SAVE_VERSION
         train_env["JAIDE_TOKENIZER_LANGUAGE"] = "english"
         train_env["JAIDE_REASONING_CYCLES"] = str(REASONING_CYCLES)
         train_env["JAIDE_RELATIONAL_PASS_INTERVAL"] = str(RELATIONAL_PASS_INTERVAL)
@@ -805,18 +855,59 @@ def run_gpu_train_and_infer(
 
         _clear_rank_coordination_files(nccl_id_path)
 
+        training_command = [str(distributed_bin)]
+        if NCU_ENABLE:
+            ncu_path = shutil.which("ncu")
+            if not ncu_path:
+                raise RuntimeError("JAIDE_BENCH_NCU=1 but ncu is unavailable")
+            training_command = [
+                ncu_path,
+                "--target-processes",
+                "all",
+                "--csv",
+                "--page",
+                "raw",
+                "--launch-count",
+                "20",
+                "--metrics",
+                "sm__warps_active.avg.pct_of_peak_sustained_active,sm__throughput.avg.pct_of_peak_sustained_elapsed,gpu__time_duration.sum",
+                str(distributed_bin),
+            ]
+        monitor_path = Path("/tmp") / f"jaide_gpu_monitor_{run_id}.csv"
+        monitor_file = monitor_path.open("w", encoding="utf-8")
+        monitor_process = subprocess.Popen(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,utilization.gpu,memory.used,memory.total,power.draw,clocks.sm",
+                "--format=csv,noheader,nounits",
+                "-lms",
+                "500",
+            ],
+            stdout=monitor_file,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
         t0 = time.time()
         training_started_ns = time.time_ns()
-        rc_c, out_c, _ = _run_multirank(
-            cmd=[str(distributed_bin)],
-            cwd=project_dir,
-            base_env=train_env,
-            num_gpus=NUM_GPUS,
-            nccl_id_path=nccl_id_path,
-            timeout=72000,
-        )
+        try:
+            rc_c, out_c, _ = _run_multirank(
+                cmd=training_command,
+                cwd=project_dir,
+                base_env=train_env,
+                num_gpus=NUM_GPUS,
+                nccl_id_path=nccl_id_path,
+                timeout=72000,
+            )
+        finally:
+            _terminate_process_group(monitor_process)
+            monitor_process.wait()
+            monitor_file.close()
         phase_c_duration = time.time() - t0
         training_succeeded = rc_c == 0
+        gpu_monitor_text = monitor_path.read_text(encoding="utf-8") if monitor_path.exists() else ""
+        gpu_monitor_metrics = _parse_gpu_monitor(gpu_monitor_text)
+        _write_report(report_dir, "phase_c_gpu_monitor.csv", gpu_monitor_text)
 
         loss_curve: List[Tuple[int, float]] = []
         recon_curve: List[Tuple[int, float]] = []
@@ -833,8 +924,10 @@ def run_gpu_train_and_infer(
             "reduction_update_ms",
             "capture_ms",
             "write_ms",
+            "step_total_ms",
         )
         timing_samples: Dict[str, List[int]] = {key: [] for key in timing_keys}
+        throughput_samples: List[Tuple[int, int]] = []
         for line in out_c.splitlines():
             for timing_key in timing_keys:
                 marker = timing_key + "="
@@ -843,6 +936,14 @@ def run_gpu_train_and_infer(
                         timing_samples[timing_key].append(int(line.split(marker, 1)[1].split()[0]))
                     except (ValueError, IndexError):
                         pass
+            if "global_tokens=" in line and "step_total_ms=" in line:
+                try:
+                    token_count = int(line.split("global_tokens=", 1)[1].split()[0])
+                    step_time_ms = int(line.split("step_total_ms=", 1)[1].split()[0])
+                    if token_count > 0 and step_time_ms > 0:
+                        throughput_samples.append((token_count, step_time_ms))
+                except (ValueError, IndexError):
+                    pass
             if "[Step " in line and "Loss:" in line:
                 try:
                     s_part = line.split("[Step ")[1].split("]")[0].strip()
@@ -914,6 +1015,18 @@ def run_gpu_train_and_infer(
             "effective_batch_size": BATCH_SIZE * NUM_GPUS,
             "epoch_metrics": epoch_metrics,
             "training_metrics_json": training_metrics_json,
+            "gpu_monitor": gpu_monitor_metrics,
+            "gpu_telemetry_available": bool(gpu_monitor_metrics),
+            "gpu_memory_telemetry_available": bool(gpu_monitor_metrics) and all(
+                "memory_used_mib" in metrics and metrics["memory_used_mib"].get("count", 0) > 0
+                for metrics in gpu_monitor_metrics.values()
+            ),
+            "ncu_enabled": NCU_ENABLE,
+            "ncu_occupancy_metric_present": ("sm__warps_active.avg.pct_of_peak_sustained_active" in out_c) if NCU_ENABLE else None,
+            "sampled_tokens_per_second": (
+                sum(tokens for tokens, _ in throughput_samples) * 1000.0 /
+                sum(milliseconds for _, milliseconds in throughput_samples)
+            ) if throughput_samples else None,
             "timing_ms": {
                 key: {
                     "count": len(values),
@@ -1120,6 +1233,16 @@ def run_gpu_train_and_infer(
                 finally:
                     _terminate_process_group(srv_proc)
 
+    training_phase = result.get("phases", {}).get("C_training_convergence", {})
+    inference_phase = result.get("phases", {}).get("D_inference", {})
+    result["verified_success"] = (
+        training_phase.get("returncode") == 0
+        and training_phase.get("gpu_telemetry_available") is True
+        and training_phase.get("gpu_memory_telemetry_available") is True
+        and training_phase.get("sampled_tokens_per_second") is not None
+        and inference_phase.get("smoke_passed") is True
+        and training_phase.get("ncu_occupancy_metric_present") is True
+    )
     gpu_phase_duration = time.time() - gpu_phase_start
     result["gpu_phase_duration_s"] = round(gpu_phase_duration, 2)
     _log("=" * 70)
@@ -1175,6 +1298,23 @@ def main() -> None:
         raise ValueError("JAIDE_BENCH_TARGET_SOURCE_FROZEN must be 0, 1, true or false")
     if SPECTRAL_DEPTH_COMPENSATION not in ("0", "1", "true", "false"):
         raise ValueError("JAIDE_BENCH_SPECTRAL_DEPTH_COMPENSATION must be 0, 1, true or false")
+    if GRAD_MEAN not in ("0", "1", "true", "false"):
+        raise ValueError("JAIDE_BENCH_GRAD_MEAN must be 0, 1, true or false")
+    if NORMALIZED_GRADIENT_FLOW not in ("0", "1", "true", "false"):
+        raise ValueError("JAIDE_BENCH_NORMALIZED_GRADIENT_FLOW must be 0, 1, true or false")
+    if SPECTRAL_INTERVAL <= 0:
+        raise ValueError("JAIDE_BENCH_SPECTRAL_INTERVAL must be positive")
+    for name, raw_value, lower, upper in (
+        ("JAIDE_BENCH_GRADIENT_CLIP_NORM", GRADIENT_CLIP_NORM, 0.0, None),
+        ("JAIDE_BENCH_SFD_TRUST_RATIO", SFD_TRUST_RATIO, 0.0, 1.0),
+        ("JAIDE_BENCH_SFD_WEIGHT_FLOOR", SFD_WEIGHT_FLOOR, 0.0, None),
+    ):
+        value = float(raw_value)
+        if not math.isfinite(value) or value <= lower or (upper is not None and value > upper):
+            raise ValueError(f"{name} is outside its valid range")
+    logdet_weight_value = float(LOGDET_WEIGHT)
+    if not math.isfinite(logdet_weight_value):
+        raise ValueError("JAIDE_BENCH_LOGDET_WEIGHT must be finite")
     learning_rate_value = float(LEARNING_RATE)
     if not math.isfinite(learning_rate_value) or learning_rate_value <= 0.0:
         raise ValueError("JAIDE_BENCH_LR must be finite and positive")
@@ -1192,14 +1332,14 @@ def main() -> None:
         print("\n" + "=" * 70)
         print("ABORT: distributed binary was not built")
         print("=" * 70)
-        return
+        raise RuntimeError("distributed binary was not built")
 
     dataset_ok = prep_result.get("phases", {}).get("C_prep_dataset", {}).get("sample_count", 0) > 0
     if not dataset_ok:
         print("\n" + "=" * 70)
         print("ABORT: dataset not prepared")
         print("=" * 70)
-        return
+        raise RuntimeError("dataset was not prepared")
 
     _log("STEP 2: run_gpu_train_and_infer")
     gpu_result = run_gpu_train_and_infer.remote(run_id, prep_result)
@@ -1207,6 +1347,8 @@ def main() -> None:
     print("GPU PHASE RESULT")
     print("=" * 70)
     print(json.dumps(gpu_result, indent=2, default=str))
+    if gpu_result.get("verified_success") is not True:
+        raise RuntimeError("GPU training, telemetry, checkpoint, or inference verification failed")
 
     final = {
         "run_id": run_id,
