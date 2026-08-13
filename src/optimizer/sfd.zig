@@ -570,8 +570,8 @@ pub const SFDConfig = struct {
     beta1: f32 = 0.9,
     beta2: f32 = 0.999,
     eps: f32 = 1e-8,
-    /// Maximum update as a fraction of the current parameter scale.
     clip_threshold: f32 = 0.1,
+    weight_floor: f32 = 1e-3,
     fisher_max: f32 = 1e6,
     warmup_steps: usize = 10,
     use_external_fisher: bool = false,
@@ -650,9 +650,6 @@ pub const KFACBlock = struct {
     pub fn preconditionGradient(self: *const KFACBlock, grad: *Tensor) !void {
         const g_dim = self.G_diag.shape.dims[0];
         const a_dim = self.A_diag.shape.dims[0];
-        // A flattened or otherwise unrelated tensor has no well-defined KFAC
-        // layer axes.  Silently applying diagonal entries by modulo indexing is
-        // mathematically meaningless, so require the actual layer matrix.
         if (grad.shape.dims.len != 2 or grad.shape.dims[0] != g_dim or grad.shape.dims[1] != a_dim) {
             return error.InvalidShape;
         }
@@ -669,10 +666,6 @@ pub const KFACBlock = struct {
         try grad.matmul(&left_scaled, &A_inv_sqrt);
     }
 
-    /// Computes the symmetric inverse square root Q diag(lambda^-1/2) Q^T.
-    /// A Jacobi eigensolver is used because the KFAC factors are symmetric and
-    /// typically small.  This is intentionally not `choleskyInverse`, which
-    /// computes M^-1 and would count curvature twice in the two-sided update.
     fn computeInverseSqrt(self: *const KFACBlock, M: *const Tensor) !Tensor {
         if (M.shape.dims.len != 2 or M.shape.dims[0] != M.shape.dims[1]) return error.InvalidShape;
         const n = M.shape.dims[0];
@@ -765,7 +758,6 @@ pub const KFACBlock = struct {
         }
         return result;
     }
-
 };
 
 pub const SpectralNormalizerConfig = struct {
@@ -814,22 +806,14 @@ pub const SpectralNormalizer = struct {
     }
 };
 
-// Experimental schedulers, simulated mixed-precision storage, mock B200 memory
-// management, and fabricated reversible/Sophia stacks used to live here.  They
-// were not connected to the training path and have deliberately been removed;
-// production optimization is implemented by SFD below and by the matching
-// Futhark kernel.
-
 pub const SFD = struct {
-    /// Bias-corrected exponential moving average of squared gradients.
     fisher_diag: Tensor,
-    /// Bias-corrected exponential moving average of gradients.
     momentum_buffer: Tensor,
     beta1: f32,
     beta2: f32,
     eps: f32,
-    /// Maximum per-element update/parameter-scale ratio.
     clip_threshold: f32,
+    weight_floor: f32,
     fisher_max: f32,
     warmup_steps: usize,
     step_count: usize,
@@ -844,10 +828,11 @@ pub const SFD = struct {
 
     pub fn initWithConfig(allocator: Allocator, param_size: usize, config: SFDConfig) !SFD {
         if (param_size == 0) return error.InvalidParamSize;
-        if (!std.math.isFinite(config.beta1) or config.beta1 <= 0.0 or config.beta1 >= 1.0) return error.InvalidBeta1;
-        if (!std.math.isFinite(config.beta2) or config.beta2 <= 0.0 or config.beta2 >= 1.0) return error.InvalidBeta2;
+        if (!std.math.isFinite(config.beta1) or config.beta1 < 0.0 or config.beta1 >= 1.0) return error.InvalidBeta1;
+        if (!std.math.isFinite(config.beta2) or config.beta2 < 0.0 or config.beta2 >= 1.0) return error.InvalidBeta2;
         if (!std.math.isFinite(config.eps) or config.eps <= 0.0) return error.InvalidEpsilon;
         if (!std.math.isFinite(config.clip_threshold) or config.clip_threshold <= 0.0 or config.clip_threshold > 1.0) return error.InvalidClipThreshold;
+        if (!std.math.isFinite(config.weight_floor) or config.weight_floor <= 0.0) return error.InvalidWeightFloor;
         if (!std.math.isFinite(config.fisher_max) or config.fisher_max <= 0.0) return error.InvalidFisherMax;
 
         const shape = [_]usize{param_size};
@@ -862,6 +847,7 @@ pub const SFD = struct {
             .beta2 = config.beta2,
             .eps = config.eps,
             .clip_threshold = config.clip_threshold,
+            .weight_floor = config.weight_floor,
             .fisher_max = config.fisher_max,
             .warmup_steps = config.warmup_steps,
             .step_count = 0,
@@ -916,26 +902,27 @@ pub const SFD = struct {
         for (params, 0..) |param, tensor_index| {
             const grad = gradients[tensor_index];
             for (grad.data, 0..) |g, element_index| {
-                // A non-finite gradient leaves every state component and the
-                // corresponding parameter unchanged, independent of alignment.
-                if (!std.math.isFinite(g)) continue;
+                const gradient_is_finite = std.math.isFinite(g);
+                const safe_gradient: f32 = if (gradient_is_finite) g else 0.0;
                 const state_index = offset + element_index;
-                const m = self.beta1 * self.momentum_buffer.data[state_index] + (1.0 - self.beta1) * g;
-                self.momentum_buffer.data[state_index] = m;
+                const old_momentum = self.momentum_buffer.data[state_index];
+                const momentum_candidate = self.beta1 * old_momentum + (1.0 - self.beta1) * safe_gradient;
+                const momentum = if (std.math.isFinite(momentum_candidate)) momentum_candidate else old_momentum;
+                self.momentum_buffer.data[state_index] = momentum;
 
                 var fisher = self.fisher_diag.data[state_index];
                 if (!self.use_external_fisher) {
-                    fisher = self.beta2 * fisher + (1.0 - self.beta2) * g * g;
-                    fisher = @min(fisher, self.fisher_max);
-                    if (!std.math.isFinite(fisher)) continue;
+                    const fisher_candidate = self.beta2 * fisher + (1.0 - self.beta2) * safe_gradient * safe_gradient;
+                    if (std.math.isFinite(fisher_candidate)) fisher = @min(fisher_candidate, self.fisher_max);
                     self.fisher_diag.data[state_index] = fisher;
                 }
+                if (!gradient_is_finite) continue;
 
-                const m_hat = m / m_correction;
+                const m_hat = momentum / m_correction;
                 const fisher_hat = if (self.use_external_fisher) fisher else fisher / f_correction;
                 if (!std.math.isFinite(fisher_hat) or fisher_hat < 0.0) continue;
                 var delta = effective_lr * m_hat / (@sqrt(fisher_hat) + self.eps);
-                const parameter_scale = @max(@abs(param.data[element_index]), @as(f32, 1e-3));
+                const parameter_scale = @max(@abs(param.data[element_index]), self.weight_floor);
                 const max_update = self.clip_threshold * parameter_scale;
                 delta = std.math.clamp(delta, -max_update, max_update);
                 const updated = param.data[element_index] - delta;
@@ -946,8 +933,6 @@ pub const SFD = struct {
         self.step_count = next_step;
     }
 
-    /// Canonical SFD update.  The fused and multi-tensor entry points delegate
-    /// to the same implementation so there is only one optimizer algorithm.
     pub fn update(self: *SFD, gradients: *const Tensor, params: *Tensor, lr: f32) !void {
         const gradient_slices = [_]Tensor{gradients.*};
         var parameter_slices = [_]*Tensor{params};
@@ -1019,11 +1004,12 @@ pub const SFD = struct {
         defer file.close();
         var buffered = std.io.bufferedWriter(file.writer());
         const writer = buffered.writer();
-        try writer.writeInt(u32, 0x53464432, .little); // SFD2
+        try writer.writeInt(u32, 0x53464433, .little);
         try writer.writeInt(u32, @bitCast(self.beta1), .little);
         try writer.writeInt(u32, @bitCast(self.beta2), .little);
         try writer.writeInt(u32, @bitCast(self.eps), .little);
         try writer.writeInt(u32, @bitCast(self.clip_threshold), .little);
+        try writer.writeInt(u32, @bitCast(self.weight_floor), .little);
         try writer.writeInt(u32, @bitCast(self.fisher_max), .little);
         try writer.writeInt(u64, @intCast(self.warmup_steps), .little);
         try writer.writeInt(u64, @intCast(self.param_size), .little);
@@ -1040,18 +1026,20 @@ pub const SFD = struct {
         var buffered = std.io.bufferedReader(file.reader());
         const reader = buffered.reader();
         const magic = try reader.readInt(u32, .little);
-        if (magic != 0x53464432) return error.InvalidStateFormat;
+        if (magic != 0x53464433) return error.InvalidStateFormat;
         const beta1: f32 = @bitCast(try reader.readInt(u32, .little));
         const beta2: f32 = @bitCast(try reader.readInt(u32, .little));
         const eps: f32 = @bitCast(try reader.readInt(u32, .little));
         const clip: f32 = @bitCast(try reader.readInt(u32, .little));
+        const weight_floor: f32 = @bitCast(try reader.readInt(u32, .little));
         const fisher_max: f32 = @bitCast(try reader.readInt(u32, .little));
         const warmup_u64 = try reader.readInt(u64, .little);
         const size_u64 = try reader.readInt(u64, .little);
         const step_u64 = try reader.readInt(u64, .little);
-        if (!std.math.isFinite(beta1) or beta1 <= 0.0 or beta1 >= 1.0 or
-            !std.math.isFinite(beta2) or beta2 <= 0.0 or beta2 >= 1.0 or
+        if (!std.math.isFinite(beta1) or beta1 < 0.0 or beta1 >= 1.0 or
+            !std.math.isFinite(beta2) or beta2 < 0.0 or beta2 >= 1.0 or
             !std.math.isFinite(eps) or eps <= 0.0 or !std.math.isFinite(clip) or clip <= 0.0 or clip > 1.0 or
+            !std.math.isFinite(weight_floor) or weight_floor <= 0.0 or
             !std.math.isFinite(fisher_max) or fisher_max <= 0.0) return error.InvalidStateFormat;
         if (warmup_u64 > std.math.maxInt(usize) or size_u64 > std.math.maxInt(usize) or step_u64 > std.math.maxInt(usize)) return error.InvalidStateFormat;
         if (@as(usize, @intCast(size_u64)) != self.param_size) return error.ShapeMismatch;
@@ -1061,6 +1049,11 @@ pub const SFD = struct {
         var momentum = try Tensor.load(self.allocator, reader);
         errdefer momentum.deinit();
         if (fisher.data.len != self.param_size or momentum.data.len != self.param_size) return error.ShapeMismatch;
+        const trailing = reader.readByte() catch |err| switch (err) {
+            error.EndOfStream => null,
+            else => return err,
+        };
+        if (trailing != null) return error.InvalidStateFormat;
         self.fisher_diag.deinit();
         self.momentum_buffer.deinit();
         self.fisher_diag = fisher;
@@ -1069,6 +1062,7 @@ pub const SFD = struct {
         self.beta2 = beta2;
         self.eps = eps;
         self.clip_threshold = clip;
+        self.weight_floor = weight_floor;
         self.fisher_max = fisher_max;
         self.warmup_steps = @intCast(warmup_u64);
         self.step_count = @intCast(step_u64);
@@ -1261,7 +1255,7 @@ test "SFD fused multi-layer update applies per-tensor slices" {
     try std.testing.expectApproxEqAbs(expected1, p1.data[0], 1e-5);
 }
 
-test "SFD skips non-finite gradients without decaying state" {
+test "SFD substitutes zero for non-finite gradients and decays state" {
     const allocator = std.testing.allocator;
     var optimizer = try SFD.initWithConfig(allocator, 2, .{ .warmup_steps = 0 });
     defer optimizer.deinit();
@@ -1281,8 +1275,8 @@ test "SFD skips non-finite gradients without decaying state" {
     gradients.data[1] = std.math.nan(f32);
     try optimizer.updateFusedFisher(&gradients, &parameters, 0.01);
     try std.testing.expectEqual(old_parameter, parameters.data[1]);
-    try std.testing.expectEqual(old_momentum, optimizer.momentum_buffer.data[1]);
-    try std.testing.expectEqual(old_fisher, optimizer.fisher_diag.data[1]);
+    try std.testing.expectApproxEqAbs(old_momentum * optimizer.beta1, optimizer.momentum_buffer.data[1], 1e-7);
+    try std.testing.expectApproxEqAbs(old_fisher * optimizer.beta2, optimizer.fisher_diag.data[1], 1e-7);
 }
 
 test "SFD fused multi rejects gradient count mismatch" {
@@ -1322,3 +1316,101 @@ test "SFD FP16 writeback clamps to representable range" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), back.data[2], 1e-3);
 }
 
+test "SFD configurable weight floor bounds first zero-weight update" {
+    const allocator = std.testing.allocator;
+    var optimizer = try SFD.initWithConfig(allocator, 1, .{
+        .beta1 = 0.0,
+        .beta2 = 0.0,
+        .clip_threshold = 0.1,
+        .weight_floor = 0.25,
+        .warmup_steps = 0,
+    });
+    defer optimizer.deinit();
+    var gradient = try Tensor.init(allocator, &.{1});
+    defer gradient.deinit();
+    var parameter = try Tensor.zeros(allocator, &.{1});
+    defer parameter.deinit();
+    gradient.data[0] = 1.0;
+    try optimizer.updateFusedFisher(&gradient, &parameter, 1.0);
+    try std.testing.expectApproxEqAbs(@as(f32, -0.025), parameter.data[0], 1e-7);
+}
+
+test "SFD3 persists complete optimizer state" {
+    const allocator = std.testing.allocator;
+    var source = try SFD.initWithConfig(allocator, 2, .{
+        .beta1 = 0.0,
+        .beta2 = 0.0,
+        .eps = 2e-7,
+        .clip_threshold = 0.07,
+        .weight_floor = 0.125,
+        .fisher_max = 17.0,
+        .warmup_steps = 3,
+    });
+    defer source.deinit();
+    source.step_count = 9;
+    source.fisher_diag.data[0] = 0.25;
+    source.fisher_diag.data[1] = 0.5;
+    source.momentum_buffer.data[0] = -0.75;
+    source.momentum_buffer.data[1] = 1.25;
+
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const directory_path = try temporary.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(directory_path);
+    const state_path = try std.fs.path.join(allocator, &.{ directory_path, "optimizer.sfd" });
+    defer allocator.free(state_path);
+    try source.saveState(state_path);
+
+    var restored = try SFD.init(allocator, 2);
+    defer restored.deinit();
+    try restored.loadState(state_path);
+    try std.testing.expectEqual(source.beta1, restored.beta1);
+    try std.testing.expectEqual(source.beta2, restored.beta2);
+    try std.testing.expectEqual(source.eps, restored.eps);
+    try std.testing.expectEqual(source.clip_threshold, restored.clip_threshold);
+    try std.testing.expectEqual(source.weight_floor, restored.weight_floor);
+    try std.testing.expectEqual(source.fisher_max, restored.fisher_max);
+    try std.testing.expectEqual(source.warmup_steps, restored.warmup_steps);
+    try std.testing.expectEqual(source.step_count, restored.step_count);
+    try std.testing.expectEqualSlices(f32, source.fisher_diag.data, restored.fisher_diag.data);
+    try std.testing.expectEqualSlices(f32, source.momentum_buffer.data, restored.momentum_buffer.data);
+}
+
+test "weighted gradient reduction produces identical local SFD state" {
+    const allocator = std.testing.allocator;
+    const config = SFDConfig{
+        .beta1 = 0.8,
+        .beta2 = 0.95,
+        .eps = 1e-7,
+        .clip_threshold = 0.08,
+        .weight_floor = 0.02,
+        .warmup_steps = 0,
+    };
+    var first_optimizer = try SFD.initWithConfig(allocator, 3, config);
+    defer first_optimizer.deinit();
+    var second_optimizer = try SFD.initWithConfig(allocator, 3, config);
+    defer second_optimizer.deinit();
+    var first_parameters = try Tensor.init(allocator, &.{3});
+    defer first_parameters.deinit();
+    var second_parameters = try Tensor.init(allocator, &.{3});
+    defer second_parameters.deinit();
+    first_parameters.data[0] = 0.2;
+    first_parameters.data[1] = -0.4;
+    first_parameters.data[2] = 0.0;
+    @memcpy(second_parameters.data, first_parameters.data);
+    const first_local = [_]f32{ 0.5, -0.25, 0.125 };
+    const second_local = [_]f32{ -0.1, 0.75, -0.5 };
+    const first_fraction: f32 = 0.25;
+    const second_fraction: f32 = 0.75;
+    var reduced_gradient = try Tensor.init(allocator, &.{3});
+    defer reduced_gradient.deinit();
+    for (reduced_gradient.data, 0..) |*value, index| {
+        value.* = first_local[index] * first_fraction + second_local[index] * second_fraction;
+    }
+    try first_optimizer.update(&reduced_gradient, &first_parameters, 0.003);
+    try second_optimizer.update(&reduced_gradient, &second_parameters, 0.003);
+    try std.testing.expectEqualSlices(f32, first_parameters.data, second_parameters.data);
+    try std.testing.expectEqualSlices(f32, first_optimizer.momentum_buffer.data, second_optimizer.momentum_buffer.data);
+    try std.testing.expectEqualSlices(f32, first_optimizer.fisher_diag.data, second_optimizer.fisher_diag.data);
+    try std.testing.expectEqual(first_optimizer.step_count, second_optimizer.step_count);
+}

@@ -91,6 +91,10 @@ pub fn build(b: *std.Build) void {
             .file = futhark_gpu_c,
             .flags = &.{"-O2"},
         });
+        distributed_futhark_exe.addCSourceFile(.{
+            .file = b.path("src/hw/accel/futhark_abi_check.c"),
+            .flags = &.{ "-O2", "-std=c11" },
+        });
         distributed_futhark_exe.addIncludePath(futhark_include);
         distributed_futhark_exe.addIncludePath(.{
             .cwd_relative = "/usr/local/cuda/include",

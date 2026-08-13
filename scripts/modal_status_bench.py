@@ -1,3 +1,4 @@
+import hashlib
 import json
 import math
 import os
@@ -38,6 +39,22 @@ IGNORE_PATTERNS = [
 ]
 
 GPU_SPEC = os.environ.get("JAIDE_BENCH_GPU", "B200:1")
+
+
+def _gpu_count_from_spec(spec: str) -> int:
+    parts = spec.rsplit(":", 1)
+    if len(parts) == 1:
+        return 1
+    try:
+        count = int(parts[1])
+    except ValueError as exc:
+        raise ValueError("JAIDE_BENCH_GPU must end in a positive GPU count") from exc
+    if count <= 0:
+        raise ValueError("JAIDE_BENCH_GPU must end in a positive GPU count")
+    return count
+
+
+ALLOCATED_GPU_COUNT = _gpu_count_from_spec(GPU_SPEC)
 TIMEOUT_SEC = int(os.environ.get("JAIDE_BENCH_TIMEOUT", "86400"))
 CPU_TIMEOUT_SEC = int(os.environ.get("JAIDE_CPU_TIMEOUT", "86400"))
 CPU_REQUEST = float(os.environ.get("JAIDE_BENCH_CPU_REQUEST", "32.0"))
@@ -50,11 +67,11 @@ BATCH_SIZE = int(os.environ.get("JAIDE_BENCH_BATCH", "32"))
 EPOCHS = int(os.environ.get("JAIDE_BENCH_EPOCHS", "1"))
 SAMPLE_CAP = int(os.environ.get("JAIDE_BENCH_SAMPLE_CAP", "500000"))
 MAX_SEQ_LEN = int(os.environ.get("JAIDE_BENCH_MAX_SEQ_LEN", "256"))
-LEARNING_RATE = os.environ.get("JAIDE_BENCH_LR", "0.005")
+LEARNING_RATE = os.environ.get("JAIDE_BENCH_LR", "0.0003")
 REASONING_CYCLES = int(os.environ.get("JAIDE_BENCH_REASONING_CYCLES", "1"))
 RELATIONAL_PASS_INTERVAL = int(os.environ.get("JAIDE_BENCH_RELATIONAL_PASS_INTERVAL", "10"))
 JAIDE_RELATIONAL_FAST = os.environ.get("JAIDE_RELATIONAL_FAST", "1")
-NUM_GPUS = int(os.environ.get("JAIDE_BENCH_NUM_GPUS", "1"))
+NUM_GPUS = int(os.environ.get("JAIDE_BENCH_NUM_GPUS", str(ALLOCATED_GPU_COUNT)))
 RECONSTRUCTION_ALPHA = os.environ.get("JAIDE_BENCH_RECONSTRUCTION_ALPHA", "0.3")
 PHASE_A_STEPS = int(os.environ.get("JAIDE_BENCH_PHASE_A_STEPS", "500"))
 PHASE_B_STEPS = int(os.environ.get("JAIDE_BENCH_PHASE_B_STEPS", "2000"))
@@ -65,8 +82,9 @@ INFERENCE_STARTUP_TIMEOUT_SEC = int(os.environ.get("JAIDE_INFERENCE_STARTUP_TIME
 MASTER_ADDR = os.environ.get("JAIDE_BENCH_MASTER_ADDR", "127.0.0.1")
 MASTER_PORT = os.environ.get("JAIDE_BENCH_MASTER_PORT", "29500")
 NCCL_DEBUG = os.environ.get("JAIDE_BENCH_NCCL_DEBUG", "WARN")
-NCCL_IB_DISABLE = os.environ.get("JAIDE_BENCH_NCCL_IB_DISABLE", "1")
-NCCL_SOCKET_IFNAME = os.environ.get("JAIDE_BENCH_NCCL_SOCKET_IFNAME", "lo")
+MASTER_IS_LOOPBACK = MASTER_ADDR in {"127.0.0.1", "localhost", "::1"}
+NCCL_IB_DISABLE = os.environ.get("JAIDE_BENCH_NCCL_IB_DISABLE", "1" if MASTER_IS_LOOPBACK else "0")
+NCCL_SOCKET_IFNAME = os.environ.get("JAIDE_BENCH_NCCL_SOCKET_IFNAME", "lo" if MASTER_IS_LOOPBACK else "^lo,docker")
 CUDA_DEVICE_ORDER = os.environ.get("JAIDE_BENCH_CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 DATASET_PATH = os.environ.get("JAIDE_BENCH_DATASET_PATH", "/data/dataset/finephrase_bench.jsonl")
 CHECKPOINT_PATH = os.environ.get("JAIDE_BENCH_CHECKPOINT_PATH", "/checkpoints/tokenizer.vocab")
@@ -77,9 +95,11 @@ SEED_OFFSET = int(os.environ.get("JAIDE_BENCH_SEED_OFFSET", "0"))
 GRAD_MEAN = os.environ.get("JAIDE_BENCH_GRAD_MEAN", "true")
 CLIP_MIN = os.environ.get("JAIDE_BENCH_CLIP_MIN", "-5.0")
 CLIP_MAX = os.environ.get("JAIDE_BENCH_CLIP_MAX", "5.0")
-CHECKPOINT_VERSION = int(os.environ.get("JAIDE_BENCH_CHECKPOINT_VERSION", "5"))
-SAVE_VERSION = os.environ.get("JAIDE_BENCH_SAVE_VERSION", "RSF0+5")
+CHECKPOINT_VERSION = int(os.environ.get("JAIDE_BENCH_CHECKPOINT_VERSION", "7"))
+SAVE_VERSION = os.environ.get("JAIDE_BENCH_SAVE_VERSION", "RSF0+7")
 MAX_TOKENS = int(os.environ.get("JAIDE_BENCH_MAX_TOKENS", "128000000"))
+CHECKPOINT_INTERVAL_EPOCHS = int(os.environ.get("JAIDE_BENCH_CHECKPOINT_INTERVAL_EPOCHS", "5"))
+RESUME_CHECKPOINT = os.environ.get("JAIDE_BENCH_RESUME_CHECKPOINT", "")
 
 app = modal.App(APP_NAME)
 
@@ -532,8 +552,9 @@ def prepare_cpu(run_id: int) -> Dict[str, Any]:
         [
             "zig",
             "build",
-            "-Dgpu=true",
+            "-Dgpu=false",
             "-Doptimize=ReleaseSafe",
+            "-Dskip-futhark=true",
         ],
         cwd=project_dir,
         env=env,
@@ -547,6 +568,7 @@ def prepare_cpu(run_id: int) -> Dict[str, Any]:
             "distributed-futhark",
             "-Dgpu=true",
             "-Doptimize=ReleaseSafe",
+            "-Dskip-futhark=true",
         ],
         cwd=project_dir,
         env=env,
@@ -564,9 +586,9 @@ def prepare_cpu(run_id: int) -> Dict[str, Any]:
         "phase_b_gpu_build.log",
         "\n".join(
             (
-                "=== inference build: zig build -Dgpu=true -Doptimize=ReleaseSafe ===",
+                "=== inference build: zig build -Dgpu=false -Doptimize=ReleaseSafe -Dskip-futhark=true ===",
                 out_b,
-                "=== distributed build: zig build distributed-futhark -Dgpu=true -Doptimize=ReleaseSafe ===",
+                "=== distributed build: zig build distributed-futhark -Dgpu=true -Doptimize=ReleaseSafe -Dskip-futhark=true ===",
                 out_b_dist,
             )
         ),
@@ -729,7 +751,8 @@ def run_gpu_train_and_infer(
         train_env["JAIDE_MODEL_DIM"] = str(MODEL_DIM)
         train_env["JAIDE_LAYERS"] = str(NUM_LAYERS)
         train_env["JAIDE_BATCH_SIZE"] = str(BATCH_SIZE)
-        train_env["JAIDE_NCCL_ID_PATH"] = "/tmp/jaide_nccl_id"
+        nccl_id_path = f"/tmp/jaide_nccl_id_{run_id}"
+        train_env["JAIDE_NCCL_ID_PATH"] = nccl_id_path
         train_env["JAIDE_TOTAL_SAMPLES"] = str(sample_count)
         train_env["JAIDE_MAX_SAMPLES"] = str(min(sample_count, SAMPLE_CAP))
         train_env["JAIDE_MAX_SEQ_LEN"] = str(MAX_SEQ_LEN)
@@ -744,6 +767,9 @@ def run_gpu_train_and_infer(
         train_env["JAIDE_CLIP_MIN"] = CLIP_MIN
         train_env["JAIDE_CLIP_MAX"] = CLIP_MAX
         train_env["JAIDE_CHECKPOINT_VERSION"] = str(CHECKPOINT_VERSION)
+        train_env["JAIDE_CHECKPOINT_INTERVAL_EPOCHS"] = str(CHECKPOINT_INTERVAL_EPOCHS)
+        if RESUME_CHECKPOINT:
+            train_env["JAIDE_RESUME_CHECKPOINT"] = RESUME_CHECKPOINT
         train_env["JAIDE_SAVE_VERSION"] = SAVE_VERSION
         train_env["JAIDE_TOKENIZER_LANGUAGE"] = "english"
         train_env["JAIDE_REASONING_CYCLES"] = str(REASONING_CYCLES)
@@ -771,10 +797,13 @@ def run_gpu_train_and_infer(
         train_env["NCCL_NVLS_ENABLE"] = "0"
         train_env["CUDA_DEVICE_ORDER"] = CUDA_DEVICE_ORDER
         train_env["JAIDE_RELATIONAL_FAST"] = JAIDE_RELATIONAL_FAST
-        futhark_cache_path = CHECKPOINT_MOUNT_PATH / "futhark_gpu_cache.bin"
+        cache_hasher = hashlib.sha256()
+        cache_hasher.update((PROJECT_MOUNT_PATH / "src/hw/accel/main.fut").read_bytes())
+        cache_hasher.update(b"futhark-0.26.4-cuda-sm100")
+        futhark_cache_path = CHECKPOINT_MOUNT_PATH / f"futhark_gpu_cache_{cache_hasher.hexdigest()[:20]}.bin"
         train_env["JAIDE_FUTHARK_CACHE"] = str(futhark_cache_path)
 
-        _clear_rank_coordination_files("/tmp/jaide_nccl_id")
+        _clear_rank_coordination_files(nccl_id_path)
 
         t0 = time.time()
         training_started_ns = time.time_ns()
@@ -783,7 +812,7 @@ def run_gpu_train_and_infer(
             cwd=project_dir,
             base_env=train_env,
             num_gpus=NUM_GPUS,
-            nccl_id_path="/tmp/jaide_nccl_id",
+            nccl_id_path=nccl_id_path,
             timeout=72000,
         )
         phase_c_duration = time.time() - t0
@@ -793,7 +822,27 @@ def run_gpu_train_and_infer(
         recon_curve: List[Tuple[int, float]] = []
         source_rms_curve: List[Tuple[int, float]] = []
         epoch_metrics: List[Dict[str, Any]] = []
+        timing_keys = (
+            "dataset_ms",
+            "tokenizer_ms",
+            "model_compile_initialization_ms",
+            "graph_ms",
+            "startup_total_ms",
+            "spectral_ms",
+            "relational_ms",
+            "reduction_update_ms",
+            "capture_ms",
+            "write_ms",
+        )
+        timing_samples: Dict[str, List[int]] = {key: [] for key in timing_keys}
         for line in out_c.splitlines():
+            for timing_key in timing_keys:
+                marker = timing_key + "="
+                if marker in line:
+                    try:
+                        timing_samples[timing_key].append(int(line.split(marker, 1)[1].split()[0]))
+                    except (ValueError, IndexError):
+                        pass
             if "[Step " in line and "Loss:" in line:
                 try:
                     s_part = line.split("[Step ")[1].split("]")[0].strip()
@@ -814,9 +863,10 @@ def run_gpu_train_and_infer(
                         source_rms_curve.append((step_index, float(rms_part)))
                     except (ValueError, IndexError):
                         pass
-            if line.startswith("[Epoch "):
+            if "[Epoch " in line and "Loss:" in line and "Time:" in line:
                 try:
-                    after_bracket = line.split("]", 1)[1]
+                    epoch_line = line.split("[Epoch ", 1)[1]
+                    after_bracket = epoch_line.split("]", 1)[1]
                     loss_str = after_bracket.split("Loss:")[1].split("|")[0].strip()
                     time_str = after_bracket.split("Time:")[1].strip().rstrip("s")
                     epoch_metrics.append(
@@ -864,6 +914,15 @@ def run_gpu_train_and_infer(
             "effective_batch_size": BATCH_SIZE * NUM_GPUS,
             "epoch_metrics": epoch_metrics,
             "training_metrics_json": training_metrics_json,
+            "timing_ms": {
+                key: {
+                    "count": len(values),
+                    "min": min(values) if values else None,
+                    "max": max(values) if values else None,
+                    "mean": (sum(values) / len(values)) if values else None,
+                }
+                for key, values in timing_samples.items()
+            },
             "converged": (len(loss_curve) >= 2 and loss_curve[-1][1] < loss_curve[0][1]) if loss_curve else False,
         }
         _write_report(report_dir, "phase_c_training.log", out_c)
@@ -1094,6 +1153,10 @@ def main() -> None:
         raise ValueError("JAIDE_BENCH_RELATIONAL_PASS_INTERVAL must be positive")
     if NUM_GPUS <= 0:
         raise ValueError("JAIDE_BENCH_NUM_GPUS must be a positive integer")
+    if NUM_GPUS != ALLOCATED_GPU_COUNT:
+        raise ValueError("JAIDE_BENCH_NUM_GPUS must match the GPU count in JAIDE_BENCH_GPU")
+    if CHECKPOINT_INTERVAL_EPOCHS < 0:
+        raise ValueError("JAIDE_BENCH_CHECKPOINT_INTERVAL_EPOCHS must be non-negative")
     if INFERENCE_STARTUP_TIMEOUT_SEC <= 0:
         raise ValueError("JAIDE_INFERENCE_STARTUP_TIMEOUT must be positive")
     try:

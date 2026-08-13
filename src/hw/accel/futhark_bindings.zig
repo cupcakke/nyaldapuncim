@@ -13,16 +13,15 @@ pub const struct_futhark_f32_1d = opaque {};
 pub const struct_futhark_f32_2d = opaque {};
 pub const struct_futhark_f32_3d = opaque {};
 pub const struct_futhark_u64_1d = opaque {};
-pub const struct_futhark_u64_2d = opaque {};
 pub const struct_futhark_i64_1d = opaque {};
 pub const struct_futhark_i64_2d = opaque {};
 pub const struct_futhark_opaque_tup3_grad_full = opaque {};
-pub const struct_futhark_opaque_tup3_arr2d_f16_arr1d_f32_arr1d_f32 = opaque {};
-pub const struct_futhark_opaque_tup3_spectral = struct_futhark_opaque_tup3_arr2d_f16_arr1d_f32_arr1d_f32;
+pub const struct_futhark_opaque_tup5_embedding_spectral = opaque {};
+pub const struct_futhark_opaque_tup3_stack_spectral = opaque {};
 pub const struct_futhark_opaque_tup7_graph_encode = opaque {};
-pub const struct_futhark_opaque_tup8_graph_encode_bitmask = opaque {};
 pub const struct_futhark_opaque_tup3_arr2d_f32_arr2d_f32_arr2d_f32 = opaque {};
-pub const struct_futhark_opaque_tup10_fused_stack_step = opaque {};
+pub const struct_futhark_opaque_tup6_fused_stack_gradients = opaque {};
+pub const struct_futhark_opaque_tup3_stack_sfd = opaque {};
 
 pub const GpuConfigurationError = error{GpuAccelerationDisabled};
 
@@ -91,13 +90,11 @@ pub extern "c" fn futhark_new_raw_f32_2d(ctx: ?*struct_futhark_context, data: ?[
 pub extern "c" fn futhark_new_raw_f32_3d(ctx: ?*struct_futhark_context, data: ?[*]u8, dim0: i64, dim1: i64, dim2: i64) ?*struct_futhark_f32_3d;
 pub extern "c" fn futhark_new_raw_i64_1d(ctx: ?*struct_futhark_context, data: ?[*]u8, dim0: i64) ?*struct_futhark_i64_1d;
 pub extern "c" fn futhark_new_raw_u64_1d(ctx: ?*struct_futhark_context, data: ?[*]u8, dim0: i64) ?*struct_futhark_u64_1d;
-pub extern "c" fn futhark_new_raw_u64_2d(ctx: ?*struct_futhark_context, data: ?[*]u8, dim0: i64, dim1: i64) ?*struct_futhark_u64_2d;
 
 pub extern "c" fn futhark_new_f32_1d(ctx: ?*struct_futhark_context, data: ?[*]const f32, dim0: i64) ?*struct_futhark_f32_1d;
 pub extern "c" fn futhark_new_f32_2d(ctx: ?*struct_futhark_context, data: ?[*]const f32, dim0: i64, dim1: i64) ?*struct_futhark_f32_2d;
 pub extern "c" fn futhark_new_f32_3d(ctx: ?*struct_futhark_context, data: ?[*]const f32, dim0: i64, dim1: i64, dim2: i64) ?*struct_futhark_f32_3d;
 pub extern "c" fn futhark_new_u64_1d(ctx: ?*struct_futhark_context, data: ?[*]const u64, dim0: i64) ?*struct_futhark_u64_1d;
-pub extern "c" fn futhark_new_u64_2d(ctx: ?*struct_futhark_context, data: ?[*]const u64, dim0: i64, dim1: i64) ?*struct_futhark_u64_2d;
 pub extern "c" fn futhark_new_i64_1d(ctx: ?*struct_futhark_context, data: ?[*]const i64, dim0: i64) ?*struct_futhark_i64_1d;
 pub extern "c" fn futhark_new_i64_2d(ctx: ?*struct_futhark_context, data: ?[*]const i64, dim0: i64, dim1: i64) ?*struct_futhark_i64_2d;
 
@@ -105,7 +102,6 @@ pub extern "c" fn futhark_free_f32_1d(ctx: ?*struct_futhark_context, arr: ?*stru
 pub extern "c" fn futhark_free_f32_2d(ctx: ?*struct_futhark_context, arr: ?*struct_futhark_f32_2d) c_int;
 pub extern "c" fn futhark_free_f32_3d(ctx: ?*struct_futhark_context, arr: ?*struct_futhark_f32_3d) c_int;
 pub extern "c" fn futhark_free_u64_1d(ctx: ?*struct_futhark_context, arr: ?*struct_futhark_u64_1d) c_int;
-pub extern "c" fn futhark_free_u64_2d(ctx: ?*struct_futhark_context, arr: ?*struct_futhark_u64_2d) c_int;
 pub extern "c" fn futhark_free_i64_1d(ctx: ?*struct_futhark_context, arr: ?*struct_futhark_i64_1d) c_int;
 pub extern "c" fn futhark_free_i64_2d(ctx: ?*struct_futhark_context, arr: ?*struct_futhark_i64_2d) c_int;
 
@@ -113,7 +109,6 @@ pub extern "c" fn futhark_values_f32_1d(ctx: ?*struct_futhark_context, arr: ?*st
 pub extern "c" fn futhark_values_f32_2d(ctx: ?*struct_futhark_context, arr: ?*struct_futhark_f32_2d, data: ?[*]f32) c_int;
 pub extern "c" fn futhark_values_f32_3d(ctx: ?*struct_futhark_context, arr: ?*struct_futhark_f32_3d, data: ?[*]f32) c_int;
 pub extern "c" fn futhark_values_u64_1d(ctx: ?*struct_futhark_context, arr: ?*struct_futhark_u64_1d, data: ?[*]u64) c_int;
-pub extern "c" fn futhark_values_u64_2d(ctx: ?*struct_futhark_context, arr: ?*struct_futhark_u64_2d, data: ?[*]u64) c_int;
 pub extern "c" fn futhark_values_i64_1d(ctx: ?*struct_futhark_context, arr: ?*struct_futhark_i64_1d, data: ?[*]i64) c_int;
 pub extern "c" fn futhark_values_i64_2d(ctx: ?*struct_futhark_context, arr: ?*struct_futhark_i64_2d, data: ?[*]i64) c_int;
 
@@ -123,13 +118,11 @@ pub extern "c" fn futhark_values_raw_f32_3d(ctx: ?*struct_futhark_context, arr: 
 pub extern "c" fn futhark_values_raw_i64_1d(ctx: ?*struct_futhark_context, arr: ?*struct_futhark_i64_1d) ?*anyopaque;
 pub extern "c" fn futhark_values_raw_i64_2d(ctx: ?*struct_futhark_context, arr: ?*struct_futhark_i64_2d) ?*anyopaque;
 pub extern "c" fn futhark_values_raw_u64_1d(ctx: ?*struct_futhark_context, arr: ?*struct_futhark_u64_1d) ?*anyopaque;
-pub extern "c" fn futhark_values_raw_u64_2d(ctx: ?*struct_futhark_context, arr: ?*struct_futhark_u64_2d) ?*anyopaque;
 
 pub extern "c" fn futhark_shape_f32_1d(ctx: ?*struct_futhark_context, arr: ?*struct_futhark_f32_1d, dims: ?[*]i64) c_int;
 pub extern "c" fn futhark_shape_f32_2d(ctx: ?*struct_futhark_context, arr: ?*struct_futhark_f32_2d, dims: ?[*]i64) c_int;
 pub extern "c" fn futhark_shape_f32_3d(ctx: ?*struct_futhark_context, arr: ?*struct_futhark_f32_3d, dims: ?[*]i64) c_int;
 pub extern "c" fn futhark_shape_u64_1d(ctx: ?*struct_futhark_context, arr: ?*struct_futhark_u64_1d, dims: ?[*]i64) c_int;
-pub extern "c" fn futhark_shape_u64_2d(ctx: ?*struct_futhark_context, arr: ?*struct_futhark_u64_2d, dims: ?[*]i64) c_int;
 pub extern "c" fn futhark_shape_i64_1d(ctx: ?*struct_futhark_context, arr: ?*struct_futhark_i64_1d, dims: ?[*]i64) c_int;
 
 pub extern "c" fn futhark_entry_matmul(ctx: ?*struct_futhark_context, out: ?*?*struct_futhark_f32_2d, a: ?*struct_futhark_f32_2d, b: ?*struct_futhark_f32_2d) c_int;
@@ -168,6 +161,20 @@ pub extern "c" fn futhark_entry_scale_matrix_f16(
     out: ?*?*struct_futhark_f16_2d,
     values: ?*struct_futhark_f16_2d,
     scale_factor: u16,
+) c_int;
+
+pub extern "c" fn futhark_entry_scale_matrix_f32(
+    ctx: ?*struct_futhark_context,
+    out: ?*?*struct_futhark_f32_2d,
+    values: ?*struct_futhark_f32_2d,
+    scale_factor: f32,
+) c_int;
+
+pub extern "c" fn futhark_entry_clip_matrix_global_norm_f32(
+    ctx: ?*struct_futhark_context,
+    out: ?*?*struct_futhark_f32_2d,
+    values: ?*struct_futhark_f32_2d,
+    clip_norm: f32,
 ) c_int;
 
 pub extern "c" fn futhark_entry_batch_forward(
@@ -291,7 +298,7 @@ pub extern "c" fn futhark_entry_embedding_update_sfd_master(
     ctx: ?*struct_futhark_context,
     out: ?*?*struct_futhark_opaque_tup3_arr2d_f32_arr2d_f32_arr2d_f32,
     master_weight: ?*const struct_futhark_f32_2d,
-    grad_weight: ?*const struct_futhark_f16_2d,
+    grad_weight: ?*const struct_futhark_f32_2d,
     momentum_state: ?*const struct_futhark_f32_2d,
     fisher_state: ?*const struct_futhark_f32_2d,
     learning_rate: f32,
@@ -299,6 +306,8 @@ pub extern "c" fn futhark_entry_embedding_update_sfd_master(
     fisher_gamma: f32,
     optimizer_step: i64,
     epsilon: f32,
+    trust_ratio: f32,
+    weight_floor: f32,
 ) c_int;
 
 pub extern "c" fn futhark_free_opaque_tup3_arr2d_f32_arr2d_f32_arr2d_f32(
@@ -342,96 +351,101 @@ pub extern "c" fn futhark_entry_rsf_stack_inverse(
     in4_clip_max: u16,
 ) c_int;
 
-pub extern "c" fn futhark_entry_rsf_stack_backward_sfd_fused(
+pub extern "c" fn futhark_entry_rsf_stack_backward_gradients_fused(
     ctx: ?*struct_futhark_context,
-    out: ?*?*struct_futhark_opaque_tup10_fused_stack_step,
+    out: ?*?*struct_futhark_opaque_tup6_fused_stack_gradients,
     in0_final_outputs: ?*const struct_futhark_f16_3d,
     in1_targets: ?*const struct_futhark_f16_3d,
     in2_originals: ?*const struct_futhark_f16_3d,
     in3_lengths: ?*const struct_futhark_i64_1d,
     in4_weights_s: ?*const struct_futhark_f16_3d,
     in5_weights_t: ?*const struct_futhark_f16_3d,
-    in6_master_weights_s: ?*const struct_futhark_f32_3d,
-    in7_master_weights_t: ?*const struct_futhark_f32_3d,
-    in8_momentum_s: ?*const struct_futhark_f32_3d,
-    in9_momentum_t: ?*const struct_futhark_f32_3d,
-    in10_fisher_s: ?*const struct_futhark_f32_3d,
-    in11_fisher_t: ?*const struct_futhark_f32_3d,
-    in12_learning_rate: f32,
-    in13_momentum_beta: f32,
-    in14_fisher_gamma: f32,
-    in15_optimizer_step: i64,
-    in16_epsilon: f32,
-    in17_clip_min: f32,
-    in18_clip_max: f32,
-    in19_reconstruction_alpha: f32,
-    in20_forward_scale: f32,
-    in21_logdet_weight: f32,
+    in6_gradient_scale: f32,
+    in7_clip_min: f32,
+    in8_clip_max: f32,
+    in9_reconstruction_alpha: f32,
+    in10_forward_scale: f32,
+    in11_logdet_weight: f32,
 ) c_int;
 
-pub extern "c" fn futhark_free_opaque_tup10_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f16_f32_f32_f32(
+pub extern "c" fn futhark_free_opaque_tup6_arr3d_f32_arr3d_f32_arr3d_f16_f32_f32_f32(
     ctx: ?*struct_futhark_context,
-    obj: ?*struct_futhark_opaque_tup10_fused_stack_step,
+    obj: ?*struct_futhark_opaque_tup6_fused_stack_gradients,
 ) c_int;
 
-pub extern "c" fn futhark_project_opaque_tup10_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f16_f32_f32_f32_0(
+pub extern "c" fn futhark_project_opaque_tup6_arr3d_f32_arr3d_f32_arr3d_f16_f32_f32_f32_0(
     ctx: ?*struct_futhark_context,
     out: ?*?*struct_futhark_f32_3d,
-    obj: ?*const struct_futhark_opaque_tup10_fused_stack_step,
+    obj: ?*const struct_futhark_opaque_tup6_fused_stack_gradients,
 ) c_int;
 
-pub extern "c" fn futhark_project_opaque_tup10_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f16_f32_f32_f32_1(
+pub extern "c" fn futhark_project_opaque_tup6_arr3d_f32_arr3d_f32_arr3d_f16_f32_f32_f32_1(
     ctx: ?*struct_futhark_context,
     out: ?*?*struct_futhark_f32_3d,
-    obj: ?*const struct_futhark_opaque_tup10_fused_stack_step,
+    obj: ?*const struct_futhark_opaque_tup6_fused_stack_gradients,
 ) c_int;
 
-pub extern "c" fn futhark_project_opaque_tup10_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f16_f32_f32_f32_2(
-    ctx: ?*struct_futhark_context,
-    out: ?*?*struct_futhark_f32_3d,
-    obj: ?*const struct_futhark_opaque_tup10_fused_stack_step,
-) c_int;
-
-pub extern "c" fn futhark_project_opaque_tup10_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f16_f32_f32_f32_3(
-    ctx: ?*struct_futhark_context,
-    out: ?*?*struct_futhark_f32_3d,
-    obj: ?*const struct_futhark_opaque_tup10_fused_stack_step,
-) c_int;
-
-pub extern "c" fn futhark_project_opaque_tup10_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f16_f32_f32_f32_4(
-    ctx: ?*struct_futhark_context,
-    out: ?*?*struct_futhark_f32_3d,
-    obj: ?*const struct_futhark_opaque_tup10_fused_stack_step,
-) c_int;
-
-pub extern "c" fn futhark_project_opaque_tup10_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f16_f32_f32_f32_5(
-    ctx: ?*struct_futhark_context,
-    out: ?*?*struct_futhark_f32_3d,
-    obj: ?*const struct_futhark_opaque_tup10_fused_stack_step,
-) c_int;
-
-pub extern "c" fn futhark_project_opaque_tup10_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f16_f32_f32_f32_6(
+pub extern "c" fn futhark_project_opaque_tup6_arr3d_f32_arr3d_f32_arr3d_f16_f32_f32_f32_2(
     ctx: ?*struct_futhark_context,
     out: ?*?*struct_futhark_f16_3d,
-    obj: ?*const struct_futhark_opaque_tup10_fused_stack_step,
+    obj: ?*const struct_futhark_opaque_tup6_fused_stack_gradients,
 ) c_int;
 
-pub extern "c" fn futhark_project_opaque_tup10_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f16_f32_f32_f32_7(
+pub extern "c" fn futhark_project_opaque_tup6_arr3d_f32_arr3d_f32_arr3d_f16_f32_f32_f32_3(
     ctx: ?*struct_futhark_context,
     out: ?*f32,
-    obj: ?*const struct_futhark_opaque_tup10_fused_stack_step,
+    obj: ?*const struct_futhark_opaque_tup6_fused_stack_gradients,
 ) c_int;
 
-pub extern "c" fn futhark_project_opaque_tup10_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f16_f32_f32_f32_8(
+pub extern "c" fn futhark_project_opaque_tup6_arr3d_f32_arr3d_f32_arr3d_f16_f32_f32_f32_4(
     ctx: ?*struct_futhark_context,
     out: ?*f32,
-    obj: ?*const struct_futhark_opaque_tup10_fused_stack_step,
+    obj: ?*const struct_futhark_opaque_tup6_fused_stack_gradients,
 ) c_int;
 
-pub extern "c" fn futhark_project_opaque_tup10_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f32_arr3d_f16_f32_f32_f32_9(
+pub extern "c" fn futhark_project_opaque_tup6_arr3d_f32_arr3d_f32_arr3d_f16_f32_f32_f32_5(
     ctx: ?*struct_futhark_context,
     out: ?*f32,
-    obj: ?*const struct_futhark_opaque_tup10_fused_stack_step,
+    obj: ?*const struct_futhark_opaque_tup6_fused_stack_gradients,
+) c_int;
+
+pub extern "c" fn futhark_entry_stack_update_sfd_master(
+    ctx: ?*struct_futhark_context,
+    out: ?*?*struct_futhark_opaque_tup3_stack_sfd,
+    master_weights: ?*const struct_futhark_f32_3d,
+    gradients: ?*const struct_futhark_f32_3d,
+    momentum_state: ?*const struct_futhark_f32_3d,
+    fisher_state: ?*const struct_futhark_f32_3d,
+    learning_rate: f32,
+    momentum_beta: f32,
+    fisher_gamma: f32,
+    optimizer_step: i64,
+    epsilon: f32,
+    trust_ratio: f32,
+    weight_floor: f32,
+) c_int;
+
+pub extern "c" fn futhark_free_opaque_tup3_arr3d_f32_arr3d_f32_arr3d_f32(
+    ctx: ?*struct_futhark_context,
+    obj: ?*struct_futhark_opaque_tup3_stack_sfd,
+) c_int;
+
+pub extern "c" fn futhark_project_opaque_tup3_arr3d_f32_arr3d_f32_arr3d_f32_0(
+    ctx: ?*struct_futhark_context,
+    out: ?*?*struct_futhark_f32_3d,
+    obj: ?*const struct_futhark_opaque_tup3_stack_sfd,
+) c_int;
+
+pub extern "c" fn futhark_project_opaque_tup3_arr3d_f32_arr3d_f32_arr3d_f32_1(
+    ctx: ?*struct_futhark_context,
+    out: ?*?*struct_futhark_f32_3d,
+    obj: ?*const struct_futhark_opaque_tup3_stack_sfd,
+) c_int;
+
+pub extern "c" fn futhark_project_opaque_tup3_arr3d_f32_arr3d_f32_arr3d_f32_2(
+    ctx: ?*struct_futhark_context,
+    out: ?*?*struct_futhark_f32_3d,
+    obj: ?*const struct_futhark_opaque_tup3_stack_sfd,
 ) c_int;
 
 pub extern "c" fn futhark_entry_oftb_forward(
@@ -477,10 +491,10 @@ pub extern "c" fn futhark_entry_embedding_forward(
 
 pub extern "c" fn futhark_entry_embedding_backward(
     ctx: ?*struct_futhark_context,
-    out: ?*?*struct_futhark_f16_2d,
+    out: ?*?*struct_futhark_f32_2d,
     tokens: ?*const struct_futhark_i64_1d,
     grad_output: ?*const struct_futhark_f16_2d,
-    grad_weight: ?*const struct_futhark_f16_2d,
+    grad_weight: ?*const struct_futhark_f32_2d,
 ) c_int;
 
 pub extern "c" fn futhark_entry_embedding_forward_padded(
@@ -494,85 +508,88 @@ pub extern "c" fn futhark_entry_embedding_forward_padded(
 
 pub extern "c" fn futhark_entry_embedding_backward_padded(
     ctx: ?*struct_futhark_context,
-    out: ?*?*struct_futhark_f16_2d,
+    out: ?*?*struct_futhark_f32_2d,
     tokens: ?*const struct_futhark_i64_1d,
     lengths: ?*const struct_futhark_i64_1d,
     grad_output: ?*const struct_futhark_f16_3d,
-    grad_weight: ?*const struct_futhark_f16_2d,
-    clip_norm: f32,
+    grad_weight: ?*const struct_futhark_f32_2d,
+) c_int;
+
+pub extern "c" fn futhark_entry_stack_spectral_normalize(
+    ctx: ?*struct_futhark_context,
+    out: ?*?*struct_futhark_opaque_tup3_stack_spectral,
+    weights: ?*const struct_futhark_f32_3d,
+    target: f32,
+    power_iters: i64,
+) c_int;
+
+pub extern "c" fn futhark_free_opaque_tup3_arr3d_f32_f32_f32(
+    ctx: ?*struct_futhark_context,
+    obj: ?*struct_futhark_opaque_tup3_stack_spectral,
+) c_int;
+
+pub extern "c" fn futhark_project_opaque_tup3_arr3d_f32_f32_f32_0(
+    ctx: ?*struct_futhark_context,
+    out: ?*?*struct_futhark_f32_3d,
+    obj: ?*const struct_futhark_opaque_tup3_stack_spectral,
+) c_int;
+
+pub extern "c" fn futhark_project_opaque_tup3_arr3d_f32_f32_f32_1(
+    ctx: ?*struct_futhark_context,
+    out: ?*f32,
+    obj: ?*const struct_futhark_opaque_tup3_stack_spectral,
+) c_int;
+
+pub extern "c" fn futhark_project_opaque_tup3_arr3d_f32_f32_f32_2(
+    ctx: ?*struct_futhark_context,
+    out: ?*f32,
+    obj: ?*const struct_futhark_opaque_tup3_stack_spectral,
 ) c_int;
 
 pub extern "c" fn futhark_entry_embedding_spectral_normalize(
     ctx: ?*struct_futhark_context,
-    out: ?*?*struct_futhark_opaque_tup3_arr2d_f16_arr1d_f32_arr1d_f32,
-    weight: ?*const struct_futhark_f16_2d,
+    out: ?*?*struct_futhark_opaque_tup5_embedding_spectral,
+    weight: ?*const struct_futhark_f32_2d,
     u: ?*const struct_futhark_f32_1d,
     v: ?*const struct_futhark_f32_1d,
     power_iters: i64,
+    target: f32,
 ) c_int;
 
-pub extern "c" fn futhark_entry_embedding_spectral_normalize_fast(
+pub extern "c" fn futhark_free_opaque_tup5_arr2d_f32_arr1d_f32_arr1d_f32_f32_f32(
     ctx: ?*struct_futhark_context,
-    out: ?*?*struct_futhark_opaque_tup3_arr2d_f16_arr1d_f32_arr1d_f32,
-    weight: ?*const struct_futhark_f16_2d,
-    u: ?*const struct_futhark_f32_1d,
-    v: ?*const struct_futhark_f32_1d,
-    power_iters: i64,
+    obj: ?*struct_futhark_opaque_tup5_embedding_spectral,
 ) c_int;
 
-pub extern "c" fn futhark_free_opaque_tup3_arr2d_f16_arr1d_f32_arr1d_f32(
+pub extern "c" fn futhark_project_opaque_tup5_arr2d_f32_arr1d_f32_arr1d_f32_f32_f32_0(
     ctx: ?*struct_futhark_context,
-    obj: ?*struct_futhark_opaque_tup3_arr2d_f16_arr1d_f32_arr1d_f32,
+    out: ?*?*struct_futhark_f32_2d,
+    obj: ?*const struct_futhark_opaque_tup5_embedding_spectral,
 ) c_int;
 
-pub extern "c" fn futhark_project_opaque_tup3_arr2d_f16_arr1d_f32_arr1d_f32_0(
-    ctx: ?*struct_futhark_context,
-    out: ?*?*struct_futhark_f16_2d,
-    obj: ?*const struct_futhark_opaque_tup3_arr2d_f16_arr1d_f32_arr1d_f32,
-) c_int;
-
-pub extern "c" fn futhark_project_opaque_tup3_arr2d_f16_arr1d_f32_arr1d_f32_1(
+pub extern "c" fn futhark_project_opaque_tup5_arr2d_f32_arr1d_f32_arr1d_f32_f32_f32_1(
     ctx: ?*struct_futhark_context,
     out: ?*?*struct_futhark_f32_1d,
-    obj: ?*const struct_futhark_opaque_tup3_arr2d_f16_arr1d_f32_arr1d_f32,
+    obj: ?*const struct_futhark_opaque_tup5_embedding_spectral,
 ) c_int;
 
-pub extern "c" fn futhark_project_opaque_tup3_arr2d_f16_arr1d_f32_arr1d_f32_2(
+pub extern "c" fn futhark_project_opaque_tup5_arr2d_f32_arr1d_f32_arr1d_f32_f32_f32_2(
     ctx: ?*struct_futhark_context,
     out: ?*?*struct_futhark_f32_1d,
-    obj: ?*const struct_futhark_opaque_tup3_arr2d_f16_arr1d_f32_arr1d_f32,
+    obj: ?*const struct_futhark_opaque_tup5_embedding_spectral,
 ) c_int;
 
-pub inline fn futhark_free_opaque_tup3_spectral(
+pub extern "c" fn futhark_project_opaque_tup5_arr2d_f32_arr1d_f32_arr1d_f32_f32_f32_3(
     ctx: ?*struct_futhark_context,
-    obj: ?*struct_futhark_opaque_tup3_spectral,
-) c_int {
-    return futhark_free_opaque_tup3_arr2d_f16_arr1d_f32_arr1d_f32(ctx, obj);
-}
+    out: ?*f32,
+    obj: ?*const struct_futhark_opaque_tup5_embedding_spectral,
+) c_int;
 
-pub inline fn futhark_project_opaque_tup3_spectral_0(
+pub extern "c" fn futhark_project_opaque_tup5_arr2d_f32_arr1d_f32_arr1d_f32_f32_f32_4(
     ctx: ?*struct_futhark_context,
-    out: ?*?*struct_futhark_f16_2d,
-    obj: ?*const struct_futhark_opaque_tup3_spectral,
-) c_int {
-    return futhark_project_opaque_tup3_arr2d_f16_arr1d_f32_arr1d_f32_0(ctx, out, obj);
-}
-
-pub inline fn futhark_project_opaque_tup3_spectral_1(
-    ctx: ?*struct_futhark_context,
-    out: ?*?*struct_futhark_f32_1d,
-    obj: ?*const struct_futhark_opaque_tup3_spectral,
-) c_int {
-    return futhark_project_opaque_tup3_arr2d_f16_arr1d_f32_arr1d_f32_1(ctx, out, obj);
-}
-
-pub inline fn futhark_project_opaque_tup3_spectral_2(
-    ctx: ?*struct_futhark_context,
-    out: ?*?*struct_futhark_f32_1d,
-    obj: ?*const struct_futhark_opaque_tup3_spectral,
-) c_int {
-    return futhark_project_opaque_tup3_arr2d_f16_arr1d_f32_arr1d_f32_2(ctx, out, obj);
-}
+    out: ?*f32,
+    obj: ?*const struct_futhark_opaque_tup5_embedding_spectral,
+) c_int;
 
 pub extern "c" fn futhark_entry_graph_batch_encode(
     ctx: ?*struct_futhark_context,
@@ -626,143 +643,4 @@ pub extern "c" fn futhark_project_opaque_tup7_arr1d_u64_arr1d_f32_arr1d_f32_arr1
     ctx: ?*struct_futhark_context,
     out: ?*?*struct_futhark_i64_1d,
     obj: ?*const struct_futhark_opaque_tup7_graph_encode,
-) c_int;
-
-pub extern "c" fn futhark_entry_graph_batch_encode_bitmask(
-    ctx: ?*struct_futhark_context,
-    out: ?*?*struct_futhark_opaque_tup8_graph_encode_bitmask,
-    in0: ?*const struct_futhark_u64_1d,
-    in1: u64,
-) c_int;
-
-pub extern "c" fn futhark_free_opaque_tup8_arr1d_u64_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_f32_arr2d_u64_arr1d_i64_arr1d_i64(
-    ctx: ?*struct_futhark_context,
-    obj: ?*struct_futhark_opaque_tup8_graph_encode_bitmask,
-) c_int;
-
-pub extern "c" fn futhark_project_opaque_tup8_arr1d_u64_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_f32_arr2d_u64_arr1d_i64_arr1d_i64_0(
-    ctx: ?*struct_futhark_context,
-    out: ?*?*struct_futhark_u64_1d,
-    obj: ?*const struct_futhark_opaque_tup8_graph_encode_bitmask,
-) c_int;
-
-pub extern "c" fn futhark_project_opaque_tup8_arr1d_u64_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_f32_arr2d_u64_arr1d_i64_arr1d_i64_1(
-    ctx: ?*struct_futhark_context,
-    out: ?*?*struct_futhark_f32_1d,
-    obj: ?*const struct_futhark_opaque_tup8_graph_encode_bitmask,
-) c_int;
-
-pub extern "c" fn futhark_project_opaque_tup8_arr1d_u64_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_f32_arr2d_u64_arr1d_i64_arr1d_i64_2(
-    ctx: ?*struct_futhark_context,
-    out: ?*?*struct_futhark_f32_1d,
-    obj: ?*const struct_futhark_opaque_tup8_graph_encode_bitmask,
-) c_int;
-
-pub extern "c" fn futhark_project_opaque_tup8_arr1d_u64_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_f32_arr2d_u64_arr1d_i64_arr1d_i64_3(
-    ctx: ?*struct_futhark_context,
-    out: ?*?*struct_futhark_f32_1d,
-    obj: ?*const struct_futhark_opaque_tup8_graph_encode_bitmask,
-) c_int;
-
-pub extern "c" fn futhark_project_opaque_tup8_arr1d_u64_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_f32_arr2d_u64_arr1d_i64_arr1d_i64_4(
-    ctx: ?*struct_futhark_context,
-    out: ?*?*struct_futhark_f32_1d,
-    obj: ?*const struct_futhark_opaque_tup8_graph_encode_bitmask,
-) c_int;
-
-pub extern "c" fn futhark_project_opaque_tup8_arr1d_u64_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_f32_arr2d_u64_arr1d_i64_arr1d_i64_5(
-    ctx: ?*struct_futhark_context,
-    out: ?*?*struct_futhark_u64_2d,
-    obj: ?*const struct_futhark_opaque_tup8_graph_encode_bitmask,
-) c_int;
-
-pub extern "c" fn futhark_project_opaque_tup8_arr1d_u64_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_f32_arr2d_u64_arr1d_i64_arr1d_i64_6(
-    ctx: ?*struct_futhark_context,
-    out: ?*?*struct_futhark_i64_1d,
-    obj: ?*const struct_futhark_opaque_tup8_graph_encode_bitmask,
-) c_int;
-
-pub extern "c" fn futhark_project_opaque_tup8_arr1d_u64_arr1d_f32_arr1d_f32_arr1d_f32_arr1d_f32_arr2d_u64_arr1d_i64_arr1d_i64_7(
-    ctx: ?*struct_futhark_context,
-    out: ?*?*struct_futhark_i64_1d,
-    obj: ?*const struct_futhark_opaque_tup8_graph_encode_bitmask,
-) c_int;
-
-pub extern "c" fn futhark_entry_pack_bitmask_self_similar(
-    ctx: ?*struct_futhark_context,
-    out: ?*?*struct_futhark_u64_2d,
-    num_nodes: i64,
-) c_int;
-
-pub extern "c" fn futhark_entry_bitmask_pack_edges(
-    ctx: ?*struct_futhark_context,
-    out: ?*?*struct_futhark_u64_2d,
-    srcs: ?*const struct_futhark_i64_1d,
-    tgts: ?*const struct_futhark_i64_1d,
-    num_nodes: i64,
-    symmetric: i64,
-) c_int;
-
-pub extern "c" fn futhark_entry_bitmask_matmul_count(
-    ctx: ?*struct_futhark_context,
-    out: ?*?*struct_futhark_f32_2d,
-    a: ?*const struct_futhark_u64_2d,
-    b: ?*const struct_futhark_u64_2d,
-) c_int;
-
-pub extern "c" fn futhark_entry_bitmask_matmul_boolean(
-    ctx: ?*struct_futhark_context,
-    out: ?*?*struct_futhark_u64_2d,
-    a: ?*const struct_futhark_u64_2d,
-    b: ?*const struct_futhark_u64_2d,
-) c_int;
-
-pub extern "c" fn futhark_entry_bitmask_propagate_signal(
-    ctx: ?*struct_futhark_context,
-    out: ?*?*struct_futhark_f32_1d,
-    adjacency: ?*const struct_futhark_u64_2d,
-    signal: ?*const struct_futhark_f32_1d,
-) c_int;
-
-pub extern "c" fn futhark_entry_bitmask_propagate_steps(
-    ctx: ?*struct_futhark_context,
-    out: ?*?*struct_futhark_f32_1d,
-    adjacency: ?*const struct_futhark_u64_2d,
-    signal: ?*const struct_futhark_f32_1d,
-    steps: i64,
-    decay: f32,
-) c_int;
-
-pub extern "c" fn futhark_entry_bitmask_union_rows(
-    ctx: ?*struct_futhark_context,
-    out: ?*?*struct_futhark_u64_2d,
-    a: ?*const struct_futhark_u64_2d,
-    b: ?*const struct_futhark_u64_2d,
-) c_int;
-
-pub extern "c" fn futhark_entry_bitmask_and_rows(
-    ctx: ?*struct_futhark_context,
-    out: ?*?*struct_futhark_u64_2d,
-    a: ?*const struct_futhark_u64_2d,
-    b: ?*const struct_futhark_u64_2d,
-) c_int;
-
-pub extern "c" fn futhark_entry_bitmask_xor_rows(
-    ctx: ?*struct_futhark_context,
-    out: ?*?*struct_futhark_u64_2d,
-    a: ?*const struct_futhark_u64_2d,
-    b: ?*const struct_futhark_u64_2d,
-) c_int;
-
-pub extern "c" fn futhark_entry_bitmask_densities(
-    ctx: ?*struct_futhark_context,
-    out: ?*?*struct_futhark_f32_1d,
-    a: ?*const struct_futhark_u64_2d,
-) c_int;
-
-pub extern "c" fn futhark_entry_bitmask_query(
-    ctx: ?*struct_futhark_context,
-    out: ?*?*struct_futhark_i64_1d,
-    a: ?*const struct_futhark_u64_2d,
-    query: ?*const struct_futhark_u64_1d,
 ) c_int;

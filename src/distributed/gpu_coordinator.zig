@@ -283,7 +283,7 @@ pub const GPUCoordinator = struct {
                     else => 4,
                 };
                 try checkCuda(
-                    nccl.cudaMemcpy(recv_buf, send_buf, count * elem_bytes, nccl.cudaMemcpyKind.cudaMemcpyDeviceToDevice),
+                    nccl.cudaMemcpy(recv_buf, send_buf, try std.math.mul(usize, count, elem_bytes), nccl.cudaMemcpyKind.cudaMemcpyDeviceToDevice),
                     tag ++ "(single-rank-copy)",
                     error.CudaMemcpyFailed,
                 );
@@ -308,17 +308,6 @@ pub const GPUCoordinator = struct {
 
     pub fn allReduceFloat16(self: *GPUCoordinator, send_buf: *const anyopaque, recv_buf: *anyopaque, count: usize) !void {
         try self.doAllReduce(send_buf, recv_buf, count, .ncclFloat16, .ncclSum, "ncclAllReduceFloat16Sum");
-    }
-
-    /// In-place average across ranks (NCCL ncclAvg op, available since 2.10).
-    /// The result on every rank equals (sum of inputs) / world_size, computed
-    /// without leaving the GPU.
-    pub fn allReduceFloat16Avg(self: *GPUCoordinator, send_buf: *const anyopaque, recv_buf: *anyopaque, count: usize) !void {
-        try self.doAllReduce(send_buf, recv_buf, count, .ncclFloat16, .ncclAvg, "ncclAllReduceFloat16Avg");
-    }
-
-    pub fn allReduceFloat32Avg(self: *GPUCoordinator, send_buf: *const anyopaque, recv_buf: *anyopaque, count: usize) !void {
-        try self.doAllReduce(send_buf, recv_buf, count, .ncclFloat32, .ncclAvg, "ncclAllReduceFloat32Avg");
     }
 
     pub fn allReduceFloat32Max(self: *GPUCoordinator, send_buf: *const anyopaque, recv_buf: *anyopaque, count: usize) !void {
@@ -356,7 +345,7 @@ pub const GPUCoordinator = struct {
                     else => 4,
                 };
                 try checkCuda(
-                    nccl.cudaMemcpy(recv_buf, send_buf, count * elem_bytes, nccl.cudaMemcpyKind.cudaMemcpyDeviceToDevice),
+                    nccl.cudaMemcpy(recv_buf, send_buf, try std.math.mul(usize, count, elem_bytes), nccl.cudaMemcpyKind.cudaMemcpyDeviceToDevice),
                     tag ++ "(single-rank-copy)",
                     error.CudaMemcpyFailed,
                 );
@@ -396,7 +385,7 @@ pub const GPUCoordinator = struct {
         if (self.world_size == 1) {
             if (send_buf != recv_buf) {
                 try checkCuda(
-                    nccl.cudaMemcpy(recv_buf, send_buf, send_count * 4, nccl.cudaMemcpyKind.cudaMemcpyDeviceToDevice),
+                    nccl.cudaMemcpy(recv_buf, send_buf, try std.math.mul(usize, send_count, @sizeOf(f32)), nccl.cudaMemcpyKind.cudaMemcpyDeviceToDevice),
                     "ncclAllGatherFloat32(single-rank-copy)",
                     error.CudaMemcpyFailed,
                 );
@@ -428,7 +417,7 @@ pub const GPUCoordinator = struct {
         if (self.world_size == 1) {
             if (send_buf != recv_buf) {
                 try checkCuda(
-                    nccl.cudaMemcpy(recv_buf, send_buf, recv_count * 4, nccl.cudaMemcpyKind.cudaMemcpyDeviceToDevice),
+                    nccl.cudaMemcpy(recv_buf, send_buf, try std.math.mul(usize, recv_count, @sizeOf(f32)), nccl.cudaMemcpyKind.cudaMemcpyDeviceToDevice),
                     "ncclReduceScatterFloat32(single-rank-copy)",
                     error.CudaMemcpyFailed,
                 );
@@ -491,4 +480,3 @@ pub const GPUCoordinator = struct {
         return self.rank == 0;
     }
 };
-

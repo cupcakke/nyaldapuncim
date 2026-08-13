@@ -19,8 +19,8 @@ let clamp_f16_weight (v: f32) : f32 =
   let safe = if f32.isnan v || f32.isinf v then 0f32 else v
   in f32.max (-65504f32) (f32.min 65504f32 safe)
 
-let mask_embedding_gradient [dim] (gradient: [dim]f32) (valid: bool) : [dim]f16 =
-  if valid then map f16.f32 gradient else replicate dim (f16.i32 0)
+let mask_embedding_gradient [dim] (gradient: [dim]f32) (valid: bool) : [dim]f32 =
+  if valid then gradient else replicate dim 0f32
 
 entry rsf_forward [n][half] (input: [n][half*2]f16)
   (weights_s: [half][half+1]f16) (weights_t: [half][half+1]f16)
@@ -81,38 +81,58 @@ let sfd_fisher_update_core [d][e]
   (weights: [d][e]f32) (gradients: [d][e]f32)
   (momentum_state: [d][e]f32) (fisher_state: [d][e]f32)
   (learning_rate: f32) (momentum_beta: f32) (fisher_gamma: f32)
-  (optimizer_step: i64) (epsilon: f32)
+  (optimizer_step: i64) (epsilon: f32) (trust_ratio: f32) (weight_floor: f32)
   : ([d][e]f32, [d][e]f32, [d][e]f32) =
-  let safe_beta = f32.max 0f32 (f32.min 0.99999f32 momentum_beta)
-  let safe_gamma = f32.max 0f32 (f32.min 0.99999f32 fisher_gamma)
+  let safe_beta = f32.max 0f32 (f32.min 0.99999994f32 momentum_beta)
+  let safe_gamma = f32.max 0f32 (f32.min 0.99999994f32 fisher_gamma)
   let safe_eps = f32.max epsilon 1e-12f32
   let step_f = f32.i64 (i64.max 1 optimizer_step)
   let momentum_correction = f32.max safe_eps (1f32 - safe_beta f32.** step_f)
   let fisher_correction = f32.max safe_eps (1f32 - safe_gamma f32.** step_f)
   let momentum_next = map2 (map2 (\m g ->
-    if f32.isnan g || f32.isinf g then m
-    else
-      let candidate = safe_beta * m + (1f32 - safe_beta) * g
-      in if f32.isnan candidate || f32.isinf candidate then m else candidate)) momentum_state gradients
+    let safe_g = if f32.isnan g || f32.isinf g then 0f32 else g
+    let candidate = safe_beta * m + (1f32 - safe_beta) * safe_g
+    in if f32.isnan candidate || f32.isinf candidate then m else candidate)) momentum_state gradients
   let fisher_next = map2 (map2 (\f g ->
-    if f32.isnan g || f32.isinf g then f
-    else
-      let candidate = safe_gamma * f + (1f32 - safe_gamma) * g * g
-      in if f32.isnan candidate || f32.isinf candidate then f else f32.min 1e6f32 candidate)) fisher_state gradients
+    let safe_g = if f32.isnan g || f32.isinf g then 0f32 else g
+    let candidate = safe_gamma * f + (1f32 - safe_gamma) * safe_g * safe_g
+    in if f32.isnan candidate || f32.isinf candidate then f else f32.min 1e6f32 candidate)) fisher_state gradients
   let weights_next = map4 (map4 (\w g m f ->
     let safe_w = if f32.isnan w || f32.isinf w then 0f32 else w
     let m_hat = m / momentum_correction
     let f_hat = f / fisher_correction
     let raw_step = learning_rate * m_hat / (f32.sqrt (f32.max f_hat 0f32) + safe_eps)
-    let max_step = 0.1f32 * f32.max 1e-3f32 (f32.abs safe_w)
+    let safe_trust_ratio = f32.max 0f32 (f32.min 1f32 trust_ratio)
+    let max_step = safe_trust_ratio * f32.max weight_floor (f32.abs safe_w)
     let clipped_step = f32.max (-max_step) (f32.min max_step raw_step)
-    in if f32.isnan g || f32.isinf g
+    let updated = safe_w - clipped_step
+    in if f32.isnan g || f32.isinf g || f32.isnan w || f32.isinf w || f32.isnan updated || f32.isinf updated
        then w
-       else clamp_f16_weight (safe_w - clipped_step))) weights gradients momentum_next fisher_next
+       else updated)) weights gradients momentum_next fisher_next
   in (copy weights_next, copy momentum_next, copy fisher_next)
 
 entry master_weights_to_f16_3d [layers][rows][columns] (weights: [layers][rows][columns]f32): *[layers][rows][columns]f16 =
   map (map (map (\value -> f16.f32 (clamp_f16_weight value)))) weights
+
+entry stack_update_sfd_master [layers][rows][columns]
+  (master_weights: *[layers][rows][columns]f32)
+  (gradients: [layers][rows][columns]f32)
+  (momentum_state: *[layers][rows][columns]f32)
+  (fisher_state: *[layers][rows][columns]f32)
+  (learning_rate: f32)
+  (momentum_beta: f32)
+  (fisher_gamma: f32)
+  (optimizer_step: i64)
+  (epsilon: f32)
+  (trust_ratio: f32)
+  (weight_floor: f32)
+  : (*[layers][rows][columns]f32, *[layers][rows][columns]f32, *[layers][rows][columns]f32) =
+  let updates = map4 (\w g m f ->
+    sfd_fisher_update_core w g m f learning_rate momentum_beta fisher_gamma optimizer_step epsilon trust_ratio weight_floor
+    ) master_weights gradients momentum_state fisher_state
+  in (map (\(w,_,_) -> w) updates,
+      map (\(_,m,_) -> m) updates,
+      map (\(_,_,f) -> f) updates)
 
 entry master_weights_to_f16_2d [rows][columns] (weights: [rows][columns]f32): *[rows][columns]f16 =
   map (map (\value -> f16.f32 (clamp_f16_weight value))) weights
@@ -121,12 +141,12 @@ entry forward_weights_to_f32_2d [rows][columns] (weights: [rows][columns]f16): *
   map (map f32.f16) weights
 
 entry embedding_update_sfd_master [vocab_size][dim]
-  (master_weight: *[vocab_size][dim]f32) (grad_weight: [vocab_size][dim]f16)
+  (master_weight: *[vocab_size][dim]f32) (grad_weight: [vocab_size][dim]f32)
   (momentum_state: *[vocab_size][dim]f32) (fisher_state: *[vocab_size][dim]f32)
   (learning_rate: f32) (momentum_beta: f32) (fisher_gamma: f32) (optimizer_step: i64) (epsilon: f32)
+  (trust_ratio: f32) (weight_floor: f32)
   : ([vocab_size][dim]f32, [vocab_size][dim]f32, [vocab_size][dim]f32) =
-  let grad_f32 = map (map f32.f16) grad_weight
-  in sfd_fisher_update_core master_weight grad_f32 momentum_state fisher_state learning_rate momentum_beta fisher_gamma optimizer_step epsilon
+  in sfd_fisher_update_core master_weight grad_weight momentum_state fisher_state learning_rate momentum_beta fisher_gamma optimizer_step epsilon trust_ratio weight_floor
 
 entry compute_loss [n][d] (output: [n][d]f16) (target: [n][d]f16) : f16 =
   let squared_diff = map2 (map2 (\o t -> (o f16.- t) f16.* (o f16.- t))) output target
@@ -289,6 +309,26 @@ entry scale_weights_inplace [d] (weights: *[d][d]f16) (scale_factor: f16) : *[d]
 entry scale_matrix_f16 [rows][columns] (values: *[rows][columns]f16) (scale_factor: f16) : *[rows][columns]f16 =
   map (map (\value -> value f16.* scale_factor)) values
 
+entry scale_matrix_f32 [rows][columns] (values: *[rows][columns]f32) (scale_factor: f32) : *[rows][columns]f32 =
+  map (map (\value -> value * scale_factor)) values
+
+entry clip_matrix_global_norm_f32 [rows][columns]
+  (values: *[rows][columns]f32) (clip_norm: f32) : *[rows][columns]f32 =
+  let flat_values = flatten values
+  let maximum_absolute_value = reduce f32.max 0f32 (map f32.abs flat_values)
+  let scaled_norm_squared =
+    if maximum_absolute_value > 0f32
+    then f32.sum (map (\value ->
+      let scaled = value / maximum_absolute_value
+      in scaled * scaled) flat_values)
+    else 0f32
+  let norm = maximum_absolute_value * f32.sqrt scaled_norm_squared
+  let scale =
+    if clip_norm > 0f32 && norm > clip_norm && norm > 1e-12f32
+    then clip_norm / norm
+    else 1f32
+  in map (map (* scale)) values
+
 entry accumulate_gradients [d] (grad1: *[d][d]f16) (grad2: [d][d]f16) : *[d][d]f16 =
   map2 (map2 (f16.+)) grad1 grad2
 
@@ -347,40 +387,25 @@ entry embedding_forward_padded [n][batch_size][seq_len][vocab_size][dim]
               in weight[safe_token]
          else replicate dim (f16.i32 0)) positions) (iota batch_size) lengths
 
-entry embedding_backward [n][vocab_size][dim] (tokens: [n]i64) (grad_output: [n][dim]f16) (grad_weight: [vocab_size][dim]f16) : *[vocab_size][dim]f16 =
-  let safe_tokens = map (\t -> if t >= 0 && t < vocab_size then t else 0) tokens
-  let updates = hist (map2 (f16.+)) (replicate dim (f16.i32 0)) vocab_size safe_tokens grad_output
-  in map2 (map2 (f16.+)) grad_weight updates
+entry embedding_backward [n][vocab_size][dim] (tokens: [n]i64) (grad_output: [n][dim]f16) (grad_weight: [vocab_size][dim]f32) : *[vocab_size][dim]f32 =
+  let valid = map (\token -> token >= 0 && token < vocab_size) tokens
+  let safe_tokens = map2 (\token is_valid -> if is_valid then token else 0) tokens valid
+  let gradients = map2 (\row is_valid -> if is_valid then map f32.f16 row else replicate dim 0f32) grad_output valid
+  let updates = hist (map2 (+)) (replicate dim 0f32) vocab_size safe_tokens gradients
+  in map2 (map2 (+)) grad_weight updates
 
 entry embedding_backward_padded [n][batch_size][seq_len][dim][vocab_size]
   (tokens: [n]i64)
   (lengths: [batch_size]i64)
   (grad_output: [batch_size][seq_len][dim]f16)
-  (grad_weight: [vocab_size][dim]f16)
-  (clip_norm: f32) : *[vocab_size][dim]f16 =
+  (grad_weight: [vocab_size][dim]f32) : *[vocab_size][dim]f32 =
   let masked_gradient_f32 = map2 (\length bi ->
     map (\j ->
       let active = j < i64.max 0 (i64.min seq_len length)
       in if active
          then map f32.f16 grad_output[bi][j]
          else replicate dim 0f32) (iota seq_len)) lengths (iota batch_size)
-  let flat_values = flatten (flatten masked_gradient_f32)
-  let maximum_absolute_value = reduce f32.max 0f32 (map f32.abs flat_values)
-  let scaled_norm_squared =
-    if maximum_absolute_value > 0f32
-    then f32.sum (map (\value ->
-      let scaled = value / maximum_absolute_value
-      in scaled * scaled) flat_values)
-    else 0f32
-  let norm = maximum_absolute_value * f32.sqrt scaled_norm_squared
-  let gradient_scale =
-    if clip_norm > 0f32 && norm > clip_norm && norm > 1e-12f32
-    then clip_norm / norm
-    else 1f32
-  let flat_gradient_f32 = map (\bi ->
-    map (\j ->
-      map (\v -> v * gradient_scale) masked_gradient_f32[bi][j]) (iota seq_len)) (iota batch_size)
-  let flat_grad_flat = flatten flat_gradient_f32
+  let flat_grad_flat = flatten masked_gradient_f32
   let flat_tokens_all = flatten (map2 (\length bi ->
     map (\j ->
       let flat_index = bi * seq_len + j
@@ -393,65 +418,72 @@ entry embedding_backward_padded [n][batch_size][seq_len][dim][vocab_size]
     let active = jj < i64.max 0 (i64.min seq_len length) && j < n
     in t >= 0 && t < vocab_size && active) flat_tokens_all (iota (batch_size * seq_len))
   let valid_tokens_unclamped = map2 (\t v -> if v then t else 0) flat_tokens_all validity
-  let valid_grads : [batch_size*seq_len][dim]f16 = map2 mask_embedding_gradient flat_grad_flat validity
+  let valid_grads : [batch_size*seq_len][dim]f32 = map2 mask_embedding_gradient flat_grad_flat validity
   let safe_tokens = map (\t -> if t >= 0 && t < vocab_size then t else 0) valid_tokens_unclamped
-  let updates = hist (map2 (f16.+)) (replicate dim (f16.i32 0)) vocab_size safe_tokens valid_grads
-  in map2 (map2 (f16.+)) grad_weight updates
+  let updates = hist (map2 (+)) (replicate dim 0f32) vocab_size safe_tokens valid_grads
+  in map2 (map2 (+)) grad_weight updates
+
+let spectral_normalize_matrix [rows][columns]
+  (weight: [rows][columns]f32)
+  (target: f32)
+  (power_iters: i64)
+  : ([rows][columns]f32, f32, f32) =
+  let initial_value = 1f32 / f32.sqrt (f32.i64 columns)
+  let initial_v = replicate columns initial_value
+  let weight_t = transpose weight
+  let (final_u, final_v) =
+    loop (_u, v) = (replicate rows 0f32, initial_v) for iteration < i64.max 1 power_iters do
+      let _ = iteration
+      let raw_u = map (\row -> f32.sum (map2 (*) row v)) weight
+      let u_norm = f32.sqrt (f32.sum (map (\value -> value * value) raw_u))
+      let safe_u_norm = f32.max u_norm 1e-12f32
+      let next_u = map (/ safe_u_norm) raw_u
+      let raw_v = map (\column -> f32.sum (map2 (*) column next_u)) weight_t
+      let v_norm = f32.sqrt (f32.sum (map (\value -> value * value) raw_v))
+      let safe_v_norm = f32.max v_norm 1e-12f32
+      let next_v = map (/ safe_v_norm) raw_v
+      in (next_u, next_v)
+  let projected = map (\row -> f32.sum (map2 (*) row final_v)) weight
+  let sigma = f32.abs (f32.sum (map2 (*) final_u projected))
+  let safe_target = f32.max target 1e-6f32
+  let scale = if sigma > safe_target then safe_target / sigma else 1f32
+  let normalized = map (map (* scale)) weight
+  in (normalized, sigma, sigma * scale)
+
+entry stack_spectral_normalize [layers][rows][columns]
+  (weights: *[layers][rows][columns]f32)
+  (target: f32)
+  (power_iters: i64)
+  : (*[layers][rows][columns]f32, f32, f32) =
+  let results = map (\weight -> spectral_normalize_matrix weight target power_iters) weights
+  let normalized = map (\(weight, _, _) -> weight) results
+  let before = reduce f32.max 0f32 (map (\(_, sigma, _) -> sigma) results)
+  let after = reduce f32.max 0f32 (map (\(_, _, sigma) -> sigma) results)
+  in (normalized, before, after)
 
 entry embedding_spectral_normalize [vocab_size][dim]
-  (weight: *[vocab_size][dim]f16)
+  (weight: *[vocab_size][dim]f32)
   (u: *[vocab_size]f32)
   (v: *[dim]f32)
-  (power_iters: i64) : (*[vocab_size][dim]f16, *[vocab_size]f32, *[dim]f32) =
-  let wf32 : [vocab_size][dim]f32 = map (map f32.f16) weight
-  let wf32_t = transpose wf32
+  (power_iters: i64)
+  (target: f32) : (*[vocab_size][dim]f32, *[vocab_size]f32, *[dim]f32, f32, f32) =
+  let weight_t = transpose weight
   let (final_u, final_v) =
-    loop (ua, _va) = (u, v) for loop_k < power_iters do
+    loop (ua, _va) = (u, v) for loop_k < i64.max 1 power_iters do
       let _ = loop_k
-      let raw_v = map (\col -> f32.sum (map2 (*) col ua)) wf32_t
-      let v_norm = f32.sqrt (f32.sum (map (\x -> x * x) raw_v))
-      let v_safe = if v_norm < 1e-12f32 then 1.0f32 else v_norm
-      let nv = map (/ v_safe) raw_v
-      let raw_u = map (\row -> f32.sum (map2 (*) row nv)) wf32
-      let u_norm = f32.sqrt (f32.sum (map (\x -> x * x) raw_u))
-      let u_safe = if u_norm < 1e-12f32 then 1.0f32 else u_norm
-      let nu = map (/ u_safe) raw_u
-      let nv_ret = copy nv
-      in (nu, nv_ret)
-  let sigma = f32.sum (map2 (\ui row -> ui * f32.sum (map2 (*) row final_v)) final_u wf32)
-  let out_weight =
-    if sigma > 1.0f32
-    then map (map (\w -> f16.f32 (w / sigma))) wf32
-    else map (map f16.f32) wf32
-  in (out_weight, copy final_u, copy final_v)
-
-entry embedding_spectral_normalize_fast [vocab_size][dim]
-  (weight: *[vocab_size][dim]f16)
-  (u: *[vocab_size]f32)
-  (v: *[dim]f32)
-  (power_iters: i64) : (*[vocab_size][dim]f16, *[vocab_size]f32, *[dim]f32) =
-  let wf32 : [vocab_size][dim]f32 = map (map f32.f16) weight
-  let wf32_t = transpose wf32
-  let (final_u, final_v) =
-    loop (ua, _va) = (u, v) for loop_k < power_iters do
-      let _ = loop_k
-      let raw_v = map (\col -> f32.sum (map2 (*) col ua)) wf32_t
-      let v_norm2 = f32.sum (map (\x -> x * x) raw_v)
-      let v_safe = if v_norm2 < 1e-24f32 then 1.0f32 else f32.sqrt v_norm2
-      let nv = map (/ v_safe) raw_v
-      let raw_u = map (\row -> f32.sum (map2 (*) row nv)) wf32
-      let u_norm2 = f32.sum (map (\x -> x * x) raw_u)
-      let u_safe = if u_norm2 < 1e-24f32 then 1.0f32 else f32.sqrt u_norm2
-      let nu = map (/ u_safe) raw_u
-      let nv_ret = copy nv
-      in (nu, nv_ret)
-  let wv = map (\row -> f32.sum (map2 (*) row final_v)) wf32
-  let sigma = f32.sum (map2 (*) final_u wv)
-  let out_weight =
-    if sigma > 1.0f32
-    then map (map (\w -> f16.f32 (w / sigma))) wf32
-    else map (map f16.f32) wf32
-  in (out_weight, copy final_u, copy final_v)
+      let raw_v = map (\column -> f32.sum (map2 (*) column ua)) weight_t
+      let v_norm = f32.sqrt (f32.sum (map (\value -> value * value) raw_v))
+      let next_v = map (/ f32.max v_norm 1e-12f32) raw_v
+      let raw_u = map (\row -> f32.sum (map2 (*) row next_v)) weight
+      let u_norm = f32.sqrt (f32.sum (map (\value -> value * value) raw_u))
+      let next_u = map (/ f32.max u_norm 1e-12f32) raw_u
+      in (next_u, copy next_v)
+  let projected = map (\row -> f32.sum (map2 (*) row final_v)) weight
+  let sigma = f32.abs (f32.sum (map2 (*) final_u projected))
+  let safe_target = f32.max target 1e-6f32
+  let scale = if sigma > safe_target then safe_target / sigma else 1f32
+  let normalized = map (map (* scale)) weight
+  in (normalized, copy final_u, copy final_v, sigma, sigma * scale)
 
 let graph_derive_qubit_states [n] (hashes: [n]u64) : ([n]f32, [n]f32, [n]f32, [n]f32) =
   let pi = 3.14159265358979323846f32
@@ -622,32 +654,20 @@ entry rsf_stack_inverse [batch_size][seq_len][half][num_layers]
     in map (\v -> f16.f32 (clamp_f16_value v)) result) flat
   in copy (unflatten out_rows :> [batch_size][seq_len][half*2]f16)
 
-entry rsf_stack_backward_sfd_fused [batch_size][seq_len][half][num_layers]
+entry rsf_stack_backward_gradients_fused [batch_size][seq_len][half][num_layers]
   (final_outputs: [batch_size][seq_len][half*2]f16)
   (targets: [batch_size][seq_len][half*2]f16)
   (originals: [batch_size][seq_len][half*2]f16)
   (lengths: [batch_size]i64)
   (weights_s: *[num_layers][half][half+1]f16)
   (weights_t: *[num_layers][half][half+1]f16)
-  (master_weights_s: *[num_layers][half][half+1]f32)
-  (master_weights_t: *[num_layers][half][half+1]f32)
-  (momentum_s: *[num_layers][half][half+1]f32)
-  (momentum_t: *[num_layers][half][half+1]f32)
-  (fisher_s: *[num_layers][half][half+1]f32)
-  (fisher_t: *[num_layers][half][half+1]f32)
-  (learning_rate: f32)
-  (momentum_beta: f32)
-  (fisher_gamma: f32)
-  (optimizer_step: i64)
-  (epsilon: f32)
+  (gradient_scale: f32)
   (clip_min: f32)
   (clip_max: f32)
   (reconstruction_alpha: f32)
   (forward_scale: f32)
   (logdet_weight: f32)
   : (*[num_layers][half][half+1]f32, *[num_layers][half][half+1]f32,
-     *[num_layers][half][half+1]f32, *[num_layers][half][half+1]f32,
-     *[num_layers][half][half+1]f32, *[num_layers][half][half+1]f32,
      *[batch_size][seq_len][half*2]f16,
      f32, f32, f32) =
   let d2 = half * 2
@@ -659,16 +679,19 @@ entry rsf_stack_backward_sfd_fused [batch_size][seq_len][half][num_layers]
   let count_elements = if valid_tokens > 0 then valid_tokens * d2 else 1
   let count_elements_f32 = f32.i64 count_elements
   let count_tokens_f32 = f32.max 1f32 (f32.i64 valid_tokens)
-  let active_flags = tabulate (batch_size * seq_len) (\t ->
+  let active_indices = filter (\t ->
     let b = t / seq_len
     let j = t % seq_len
-    in j < limits[b])
-  let initial_grads = map3 (\y t act ->
+    in j < limits[b]) (iota (batch_size * seq_len))
+  let active_final = map (\t -> flat_final[t]) active_indices
+  let active_targets = map (\t -> flat_targets[t]) active_indices
+  let active_orig = map (\t -> flat_orig[t]) active_indices
+  let initial_grads = map2 (\y t ->
     map2 (\yv tv ->
       let diff = f32.f16 yv - f32.f16 tv
       let safe_diff = if f32.isnan diff || f32.isinf diff then 0f32 else f32.max (-100f32) (f32.min 100f32 diff)
-      in if act then 2f32 * safe_diff else 0f32) y t) flat_final flat_targets active_flags
-  let y_start = map (map f32.f16) flat_final
+      in 2f32 * safe_diff / count_elements_f32) y t) active_final active_targets
+  let y_start = map (map f32.f16) active_final
   let gs_zero = replicate half (replicate (half + 1) 0f32)
   let (gs_stack, gt_stack, x_stack, g_stack, ld_stack) =
     loop (gs_acc, gt_acc, y_all, g_all, ld_all) =
@@ -676,12 +699,12 @@ entry rsf_stack_backward_sfd_fused [batch_size][seq_len][half][num_layers]
        replicate num_layers (copy gs_zero),
        y_start,
        initial_grads,
-       replicate (batch_size * seq_len) 0f32)
+       replicate valid_tokens 0f32)
     for i < num_layers do
       let l = num_layers - 1 - i
       let ws = copy weights_s[l]
       let wt = copy weights_t[l]
-      let per_tok = map3 (\y_row g_row act ->
+      let per_tok = map2 (\y_row g_row ->
         let y1p = y_row[0:half] :> [half]f32
         let y2p = y_row[half:d2] :> [half]f32
         let g1p = g_row[0:half] :> [half]f32
@@ -704,222 +727,59 @@ entry rsf_stack_backward_sfd_fused [batch_size][seq_len][half][num_layers]
         let scale = map f32.exp clipped
         let x1 = map2 (/) u1 scale
         let dx1 = map2 (*) dy1_total scale
-        let ld_shift = if act then logdet_weight else 0f32
+        let ld_shift = logdet_weight / count_tokens_f32
         let ds = map3 (\p dt_j u_j ->
           if p >= clip_min && p <= clip_max then dt_j * u_j + ld_shift else 0f32) pre_scale dy1_total u1
         let dx2 = map (\j ->
           h2[j] + f32.sum (map (\d -> ds[d] * f32.f16 ws[d][j]) (iota half))) (iota half)
-        let gs_l = map (\d ->
-          let row_body = map (\j -> ds[d] * x2[j]) (iota half)
-          in (row_body ++ [ds[d]]) :> [half+1]f32) (iota half)
-        let gt_l = map (\d ->
-          let row_body = map (\j -> h2[d] * u1[j]) (iota half)
-          in (row_body ++ [h2[d]]) :> [half+1]f32) (iota half)
         let y_next = (x1 ++ x2) :> [half*2]f32
         let g_next = (dx1 ++ dx2) :> [half*2]f32
-        let ld_tok = if act then f32.sum clipped else 0f32
-        in (gs_l, gt_l, y_next, g_next, ld_tok)) y_all g_all active_flags
-      let gs_l_total = reduce (map2 (map2 (+))) (copy gs_zero) (map (\(a,_,_,_,_) -> a) per_tok)
-      let gt_l_total = reduce (map2 (map2 (+))) (copy gs_zero) (map (\(_,b,_,_,_) -> b) per_tok)
-      let y_next_all = map (\(_,_,c,_,_) -> c) per_tok
-      let g_next_all = map (\(_,_,_,dd,_) -> dd) per_tok
-      let ld_next = map2 (+) ld_all (map (\(_,_,_,_,e) -> e) per_tok)
+        let ld_tok = f32.sum clipped
+        in (ds, h2, x2, u1, y_next, g_next, ld_tok)) y_all g_all
+      let ds_columns = transpose (map (\(ds,_,_,_,_,_,_) -> ds) per_tok)
+      let h2_columns = transpose (map (\(_,h2,_,_,_,_,_) -> h2) per_tok)
+      let x2_columns = transpose (map (\(_,_,x2,_,_,_,_) -> x2) per_tok)
+      let u1_columns = transpose (map (\(_,_,_,u1,_,_,_) -> u1) per_tok)
+      let gs_l_total = map (\ds_column ->
+        let row_body = map (\x2_column -> f32.sum (map2 (*) ds_column x2_column)) x2_columns
+        in (row_body ++ [f32.sum ds_column]) :> [half+1]f32) ds_columns
+      let gt_l_total = map (\h2_column ->
+        let row_body = map (\u1_column -> f32.sum (map2 (*) h2_column u1_column)) u1_columns
+        in (row_body ++ [f32.sum h2_column]) :> [half+1]f32) h2_columns
+      let y_next_all = map (\(_,_,_,_,y_next,_,_) -> y_next) per_tok
+      let g_next_all = map (\(_,_,_,_,_,g_next,_) -> g_next) per_tok
+      let ld_next = map2 (+) ld_all (map (\(_,_,_,_,_,_,ld_tok) -> ld_tok) per_tok)
       in (gs_acc with [l] = gs_l_total,
           gt_acc with [l] = gt_l_total,
           y_next_all,
           g_next_all,
           ld_next)
-  let gs_mean = map (map (map (\v -> v / count_tokens_f32))) gs_stack
-  let gt_mean = map (map (map (\v -> v / count_tokens_f32))) gt_stack
-  let loss_total = reduce (+) 0f32 (map3 (\y t act ->
-    if act then f32.sum (map2 (\yv tv ->
+  let gs_normalized = map (map (map (* gradient_scale))) gs_stack
+  let gt_normalized = map (map (map (* gradient_scale))) gt_stack
+  let loss_total = reduce (+) 0f32 (map2 (\y t ->
+    f32.sum (map2 (\yv tv ->
       let diff = f32.f16 yv - f32.f16 tv
       let safe = if f32.isnan diff || f32.isinf diff then 0f32 else diff
-      in safe * safe) y t) else 0f32) flat_final flat_targets active_flags)
+      in safe * safe) y t)) active_final active_targets)
   let loss = loss_total / count_elements_f32
-  let recon_total = reduce (+) 0f32 (map3 (\x_row o_row act ->
-    if act then f32.sum (map2 (\xv ov ->
+  let recon_total = reduce (+) 0f32 (map2 (\x_row o_row ->
+    f32.sum (map2 (\xv ov ->
       let diff = xv - f32.f16 ov
       let safe = if f32.isnan diff || f32.isinf diff then 0f32 else diff
-      in safe * safe) x_row o_row) else 0f32) x_stack flat_orig active_flags)
+      in safe * safe) x_row o_row)) x_stack active_orig)
   let recon_loss = recon_total / count_elements_f32
   let logdet_total = reduce (+) 0f32 ld_stack
   let logdet_mean = logdet_total / count_tokens_f32
-  let input_delta = map4 (\g_row x_row o_row act ->
+  let active_input_delta = map3 (\g_row x_row o_row ->
     map3 (\gv xv ov ->
       let base = forward_scale * gv
-      let combined =
-        if act
-        then
-          let diff = xv - f32.f16 ov
-          let safe_diff = if f32.isnan diff || f32.isinf diff then 0f32 else f32.max (-100f32) (f32.min 100f32 diff)
-          in base + reconstruction_alpha * 2f32 * safe_diff / count_elements_f32
-        else base
+      let diff = xv - f32.f16 ov
+      let safe_diff = if f32.isnan diff || f32.isinf diff then 0f32 else f32.max (-100f32) (f32.min 100f32 diff)
+      let combined = base + reconstruction_alpha * 2f32 * safe_diff / count_elements_f32
       in f16.f32 (f32.max (-65504f32) (f32.min 65504f32 combined))) g_row x_row o_row
-    ) g_stack x_stack flat_orig active_flags
+    ) g_stack x_stack active_orig
+  let zero_delta = replicate (batch_size * seq_len) (replicate d2 0f16)
+  let input_delta = scatter zero_delta active_indices active_input_delta
   let input_delta_3d = unflatten input_delta :> [batch_size][seq_len][half*2]f16
-  let s_updates = map4 (\w g m f ->
-    sfd_fisher_update_core w g m f learning_rate momentum_beta fisher_gamma optimizer_step epsilon
-    ) master_weights_s gs_mean momentum_s fisher_s
-  let t_updates = map4 (\w g m f ->
-    sfd_fisher_update_core w g m f learning_rate momentum_beta fisher_gamma optimizer_step epsilon
-    ) master_weights_t gt_mean momentum_t fisher_t
-  let new_master_weights_s = map (\(w,_,_) -> w) s_updates
-  let new_momentum_s = map (\(_,m,_) -> m) s_updates
-  let new_fisher_s = map (\(_,_,f) -> f) s_updates
-  let new_master_weights_t = map (\(w,_,_) -> w) t_updates
-  let new_momentum_t = map (\(_,m,_) -> m) t_updates
-  let new_fisher_t = map (\(_,_,f) -> f) t_updates
-  in (new_master_weights_s, new_master_weights_t,
-      new_momentum_s, new_momentum_t,
-      new_fisher_s, new_fisher_t,
-      input_delta_3d,
+  in (copy gs_normalized, copy gt_normalized, input_delta_3d,
       f32.max 0f32 loss, f32.max 0f32 recon_loss, logdet_mean)
-
-let bitmask_word_count (n: i64): i64 =
-  let safe_n = i64.max 0 n
-  in (safe_n + 63) / 64
-
-let bitmask_legality (i: i64) (j: i64) (n: i64): bool =
-  i >= 0 && j >= 0 && i < n && j < n && i != j
-
-let bitmask_self_similar_word (i: i64) (k: i64) (n: i64): u64 =
-  let base = k * 64
-  in loop mask = 0u64 for b < 64 do
-    let j = base + b
-    in if bitmask_legality i j n
-       then
-         let rel = i - j
-         let self_similar = rel > 0 && rel <= 3
-         in if self_similar
-            then mask u64.| (1u64 u64.<< u64.i64 b)
-            else mask
-       else mask
-
-let bitmask_pack_self_similar (n: i64): [][]u64 =
-  let safe_n = i64.max 0 n
-  let w = bitmask_word_count safe_n
-  in tabulate safe_n (\i -> tabulate w (\k -> bitmask_self_similar_word i k safe_n))
-
-let bitmask_popcount_row [w] (row: [w]u64): i64 =
-  reduce (+) 0i64 (map (\x -> i64.i32 (u64.popc x)) row)
-
-let bitmask_intersect_popcount [w] (a: [w]u64) (b: [w]u64): i64 =
-  reduce (+) 0i64 (map2 (\x y -> i64.i32 (u64.popc (x u64.& y))) a b)
-
-let bitmask_rows_matmul_counts [n][w] (a: [n][w]u64) (b: [n][w]u64): [n][n]f32 =
-  map (\arow ->
-    map (\brow -> f32.i64 (bitmask_intersect_popcount arow brow)) b
-  ) a
-
-let bitmask_rows_bmma [n][w] (a: [n][w]u64) (b: [n][w]u64): [n][w]u64 =
-  map (\arow ->
-    map (\k ->
-      let base = k * 64
-      in loop mask = 0u64 for bit < 64 do
-        let j = base + bit
-        in if j < n && bitmask_intersect_popcount arow b[j] > 0
-           then mask u64.| (1u64 u64.<< u64.i64 bit)
-           else mask
-    ) (iota w)
-  ) a
-
-let bitmask_signal_propagate [n][w] (adjacency: [n][w]u64) (signal: [n]f32): [n]f32 =
-  map (\i ->
-    let row = adjacency[i]
-    in loop acc = 0f32 for wi < w do
-      let word = row[wi]
-      let base = wi * 64
-      in loop inner = acc for b < 64 do
-        let j = base + b
-        let bit_set = (word u64.>> u64.i64 b) u64.& 1u64
-        in if bit_set != 0u64 && j < n
-           then inner + signal[j]
-           else inner
-  ) (iota n)
-
-let bitmask_signal_propagate_steps [n][w] (adjacency: [n][w]u64) (signal: [n]f32) (steps: i64) (decay: f32): [n]f32 =
-  let safe_decay = f32.max 0f32 (f32.min 1f32 decay)
-  in loop cur = copy signal for _it < (i64.max 0 steps) do
-    let propagated = bitmask_signal_propagate adjacency cur
-    in map2 (\p s -> s + safe_decay * p) propagated cur
-
-let bitmask_unions [n][w] (a: [n][w]u64) (b: [n][w]u64): [n][w]u64 =
-  map2 (map2 (u64.|)) a b
-
-let bitmask_intersections [n][w] (a: [n][w]u64) (b: [n][w]u64): [n][w]u64 =
-  map2 (map2 (u64.&)) a b
-
-let bitmask_symmetric_difference [n][w] (a: [n][w]u64) (b: [n][w]u64): [n][w]u64 =
-  map2 (map2 (u64.^)) a b
-
-let bitmask_row_densities [n][w] (a: [n][w]u64): [n]f32 =
-  let total_bits = w * 64
-  in if total_bits <= 0 then replicate n 0f32
-     else map (\row -> f32.i64 (bitmask_popcount_row row) / f32.i64 total_bits) a
-
-let bitmask_query_projection [n][w] (a: [n][w]u64) (query: [w]u64): [n]i64 =
-  map (\row -> bitmask_intersect_popcount row query) a
-
-entry pack_bitmask_self_similar (num_nodes: i64): [][]u64 =
-  bitmask_pack_self_similar num_nodes
-
-entry bitmask_pack_edges [ne] (srcs: [ne]i64) (tgts: [ne]i64) (num_nodes: i64) (symmetric: i64) : [][]u64 =
-  let n = i64.max 0 num_nodes
-  let w = bitmask_word_count n
-  let flat_targets = ne * 2
-  let sym = symmetric != 0
-  let all_srcs = srcs ++ map (\t -> if sym then t else 0) tgts :> [flat_targets]i64
-  let all_tgts = tgts ++ map (\s -> if sym then s else 0) srcs :> [flat_targets]i64
-  let indices = map2 (\s t ->
-    if s >= 0 && s < n && t >= 0 && t < n && s != t
-    then s * w + t / 64
-    else 0) all_srcs all_tgts
-  let values = map2 (\s t ->
-    if s >= 0 && s < n && t >= 0 && t < n && s != t
-    then 1u64 u64.<< u64.i64 (t % 64)
-    else 0u64) all_srcs all_tgts
-  let flat = hist (u64.|) 0u64 (n * w) indices values
-  in if n == 0 then replicate 0 (replicate 0 0u64)
-     else unflatten flat :> [n][w]u64
-
-entry bitmask_matmul_count [n][w] (a: [n][w]u64) (b: [n][w]u64): [][]f32 =
-  bitmask_rows_matmul_counts a b
-
-entry bitmask_matmul_boolean [n][w] (a: [n][w]u64) (b: [n][w]u64): [][]u64 =
-  bitmask_rows_bmma a b
-
-entry bitmask_propagate_signal [n][w] (adjacency: [n][w]u64) (signal: [n]f32): []f32 =
-  bitmask_signal_propagate adjacency signal
-
-entry bitmask_propagate_steps [n][w] (adjacency: [n][w]u64) (signal: [n]f32) (steps: i64) (decay: f32): []f32 =
-  bitmask_signal_propagate_steps adjacency signal steps decay
-
-entry bitmask_union_rows [n][w] (a: [n][w]u64) (b: [n][w]u64): [][]u64 =
-  bitmask_unions a b
-
-entry bitmask_and_rows [n][w] (a: [n][w]u64) (b: [n][w]u64): [][]u64 =
-  bitmask_intersections a b
-
-entry bitmask_xor_rows [n][w] (a: [n][w]u64) (b: [n][w]u64): [][]u64 =
-  bitmask_symmetric_difference a b
-
-entry bitmask_densities [n][w] (a: [n][w]u64): []f32 =
-  bitmask_row_densities a
-
-entry bitmask_query [n][w] (a: [n][w]u64) (query: [w]u64): []i64 =
-  bitmask_query_projection a query
-
-entry graph_batch_encode_bitmask [n] (data_hashes: [n]u64) (_seed: u64) : ([]u64, []f32, []f32, []f32, []f32, [][]u64, []i64, []i64) =
-  let (re_a, im_a, re_b, im_b) = graph_derive_qubit_states data_hashes
-  let ne = n * 3
-  let edge_srcs = tabulate ne (\flat_i ->
-    let node_i = flat_i / 3
-    let pred_k = flat_i % 3
-    in if node_i > pred_k then node_i else -1i64)
-  let edge_tgts = tabulate ne (\flat_i ->
-    let node_i = flat_i / 3
-    let pred_k = flat_i % 3
-    in if node_i > pred_k then node_i - pred_k - 1 else -1i64)
-  let bitmask = bitmask_pack_self_similar n
-  in (copy data_hashes, re_a, im_a, re_b, im_b, bitmask, edge_srcs, edge_tgts)

@@ -285,8 +285,6 @@ pub const ZVariable = struct {
         errdefer self.allocator.free(node_id_copy);
         try self.creation_order.append(node_id_copy);
 
-        self.allocator.free(node_id);
-
         var hasher = std.hash.Wyhash.init(0);
         hasher.update(value);
         const hash_val = hasher.final();
@@ -360,7 +358,7 @@ pub const ZVariable = struct {
             }
         }
 
-        const edge = Edge.init(
+        const edge = try Edge.init(
             self.allocator,
             self_node_id,
             other_node_id,
@@ -423,7 +421,7 @@ pub const ZVariable = struct {
         };
     }
 
-    pub fn getTopologySignature(self: *const Self) []const u8 {
+    pub fn getTopologySignature(self: *const Self) ![]const u8 {
         return self.graph.getTopologyHashHex();
     }
 
@@ -860,7 +858,7 @@ pub const ZRuntime = struct {
             const node_count = variable.graph.nodeCount();
             const edge_count = variable.graph.edgeCount();
             const fractal_dim = variable.getFractalDimension();
-            const topo_hash = variable.getTopologySignature();
+            const topo_hash = try variable.getTopologySignature();
             const current_value = variable.getValue();
 
             const name_duped = try self.allocator.dupe(u8, var_name);
@@ -1123,7 +1121,7 @@ pub const ZRuntime = struct {
     }
 
     pub fn initializeGlobalQubit(self: *Self, amp_real: f64, amp_imag: f64, phase: f64) !usize {
-        return self.global_logic.initializeState(amp_real, amp_imag, phase);
+        return self.global_logic.initializeState(amp_real, amp_imag, 0.0, 0.0, phase);
     }
 
     pub fn measureGlobalQubit(self: *Self, qubit_index: usize) MeasurementResult {
@@ -1223,7 +1221,8 @@ test "ZVariable measure" {
     const result = variable.measure();
 
     try testing.expect(result.result == 0 or result.result == 1);
-    try testing.expect(result.probability >= 0.0 and result.probability <= 1.0);
+    try testing.expect(result.probability_zero >= 0.0 and result.probability_zero <= 1.0);
+    try testing.expect(result.probability_one >= 0.0 and result.probability_one <= 1.0);
 }
 
 test "ZRuntime init and deinit" {
@@ -1469,4 +1468,3 @@ test "ZRuntime executeQuantumCircuit" {
     const fail = try runtime.executeQuantumCircuit("nonexistent", &circuit);
     try testing.expect(!fail);
 }
-

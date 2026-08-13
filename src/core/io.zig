@@ -10,7 +10,7 @@ pub const IoConfig = struct {
     pub const LARGE_CHUNK_SIZE: usize = 65536;
     pub const MAX_READ_BYTES: usize = 100 * 1024 * 1024;
     pub const MAX_FILE_SIZE: usize = 1024 * 1024 * 1024;
-    pub const PAGE_SIZE: usize = mem.page_size;
+    pub const PAGE_SIZE: usize = std.heap.page_size_min;
     pub const TRUNCATE_SHIFT: u6 = 32;
     pub const SECURE_FILE_MODE: u9 = 0o600;
     pub const MAX_PATH_LEN: usize = 4096;
@@ -110,13 +110,12 @@ fn addChecked(a: usize, b: usize) !usize {
 
 pub const MMAP = struct {
     file: fs.File,
-    buffer: ?[]align(mem.page_size) u8,
+    buffer: ?[]align(std.heap.page_size_min) u8,
     allocator: Allocator,
     is_writable: bool,
     actual_size: usize,
     mutex: std.Thread.Mutex,
     released: bool,
-    last_read: ?[]u8,
 
     pub fn open(allocator: Allocator, path: []const u8, mode: fs.File.OpenFlags) !MMAP {
         const file = try openFilePath(path, mode);
@@ -156,16 +155,9 @@ pub const MMAP = struct {
         }
 
         const aligned_size = mem.alignForward(usize, file_size, IoConfig.PAGE_SIZE);
-        const map_flags: u32 = if (is_writable) std.posix.MAP.SHARED else std.posix.MAP.PRIVATE;
+        const map_flags: std.posix.MAP = if (is_writable) .{ .TYPE = .SHARED } else .{ .TYPE = .PRIVATE };
 
-        const buffer = try std.posix.mmap(
-            null,
-            aligned_size,
-            prot_flags,
-            map_flags,
-            file.handle,
-            0
-        );
+        const buffer = try std.posix.mmap(null, aligned_size, prot_flags, map_flags, file.handle, 0);
 
         return .{
             .file = file,
@@ -175,7 +167,6 @@ pub const MMAP = struct {
             .actual_size = file_size,
             .mutex = .{},
             .released = false,
-            .last_read = null,
         };
     }
 
@@ -184,10 +175,6 @@ pub const MMAP = struct {
         defer self.mutex.unlock();
         if (self.released) return;
         self.released = true;
-        if (self.last_read) |lr| {
-            self.allocator.free(lr);
-            self.last_read = null;
-        }
         if (self.buffer) |buf| {
             std.posix.munmap(buf);
             self.buffer = null;
@@ -208,13 +195,8 @@ pub const MMAP = struct {
         const end = try addChecked(offset, len);
         const read_end = @min(end, self.actual_size);
         const actual_len = read_end - offset;
-        if (self.last_read) |lr| {
-            self.allocator.free(lr);
-            self.last_read = null;
-        }
         const result = try self.allocator.alloc(u8, actual_len);
         @memcpy(result, buf[offset..read_end]);
-        self.last_read = result;
         return result;
     }
 
@@ -271,16 +253,9 @@ pub const MMAP = struct {
 
         var prot_flags: u32 = std.posix.PROT.READ;
         if (self.is_writable) prot_flags |= std.posix.PROT.WRITE;
-        const map_flags: u32 = if (self.is_writable) std.posix.MAP.SHARED else std.posix.MAP.PRIVATE;
+        const map_flags: std.posix.MAP = if (self.is_writable) .{ .TYPE = .SHARED } else .{ .TYPE = .PRIVATE };
 
-        const new_buf = std.posix.mmap(
-            null,
-            aligned_size,
-            prot_flags,
-            map_flags,
-            self.file.handle,
-            0
-        ) catch {
+        const new_buf = std.posix.mmap(null, aligned_size, prot_flags, map_flags, self.file.handle, 0) catch {
             return IoError.BufferNotMapped;
         };
 
@@ -354,7 +329,7 @@ pub const DurableWriter = struct {
                 continue;
             }
             const to_copy = @min(remaining.len, space);
-            @memcpy(self.buffer[self.pos..self.pos + to_copy], remaining[0..to_copy]);
+            @memcpy(self.buffer[self.pos .. self.pos + to_copy], remaining[0..to_copy]);
             self.pos += to_copy;
             remaining = remaining[to_copy..];
         }
@@ -385,7 +360,7 @@ pub const DurableWriter = struct {
                 continue;
             }
             const to_copy = @min(remaining.len, space);
-            @memcpy(self.buffer[self.pos..self.pos + to_copy], remaining[0..to_copy]);
+            @memcpy(self.buffer[self.pos .. self.pos + to_copy], remaining[0..to_copy]);
             self.pos += to_copy;
             remaining = remaining[to_copy..];
         }
@@ -460,7 +435,7 @@ pub const BufferedReader = struct {
         while (total < buf.len) {
             if (self.pos < self.limit) {
                 const avail = @min(self.limit - self.pos, buf.len - total);
-                @memcpy(buf[total..total + avail], self.buffer[self.pos..self.pos + avail]);
+                @memcpy(buf[total .. total + avail], self.buffer[self.pos .. self.pos + avail]);
                 self.pos += avail;
                 total += avail;
             } else {
@@ -509,7 +484,7 @@ pub const BufferedReader = struct {
                     if (list.items.len > 0 and list.items[list.items.len - 1] == '\r') {
                         _ = list.pop();
                     }
-                    return list.toOwnedSlice();
+                    return @as(?[]u8, try list.toOwnedSlice());
                 } else {
                     try list.appendSlice(chunk);
                     self.pos = self.limit;
@@ -520,7 +495,7 @@ pub const BufferedReader = struct {
                     if (list.items.len > 0 and list.items[list.items.len - 1] == '\r') {
                         _ = list.pop();
                     }
-                    return list.toOwnedSlice();
+                    return @as(?[]u8, try list.toOwnedSlice());
                 }
             }
         }
@@ -587,7 +562,7 @@ pub const BufferedWriter = struct {
             }
             const available = self.buffer.len - self.pos;
             const to_write = @min(available, remaining.len);
-            @memcpy(self.buffer[self.pos..self.pos + to_write], remaining[0..to_write]);
+            @memcpy(self.buffer[self.pos .. self.pos + to_write], remaining[0..to_write]);
             self.pos += to_write;
             remaining = remaining[to_write..];
         }
@@ -730,12 +705,7 @@ pub fn copyFile(allocator: Allocator, src: []const u8, dst: []const u8) !void {
     return copyFileWithProgress(allocator, src, dst, null);
 }
 
-pub fn copyFileWithProgress(
-    allocator: Allocator,
-    src: []const u8,
-    dst: []const u8,
-    progress_callback: ?*const fn(CopyProgress) void
-) !void {
+pub fn copyFileWithProgress(allocator: Allocator, src: []const u8, dst: []const u8, progress_callback: ?*const fn (CopyProgress) void) !void {
     const src_file = try openFilePath(src, .{});
     defer src_file.close();
 
@@ -885,7 +855,7 @@ pub fn sequentialWrite(allocator: Allocator, path: []const u8, data: []const []c
     try writer.sync();
 }
 
-pub fn sequentialRead(allocator: Allocator, path: []const u8, chunk_callback: *const fn([]const u8) anyerror!void) !void {
+pub fn sequentialRead(allocator: Allocator, path: []const u8, chunk_callback: *const fn ([]const u8) anyerror!void) !void {
     const file = try openFilePath(path, .{});
     defer file.close();
 
@@ -901,7 +871,7 @@ pub fn sequentialRead(allocator: Allocator, path: []const u8, chunk_callback: *c
 
 pub fn atomicWrite(path: []const u8, data: []const u8) !void {
     var temp_buf: [IoConfig.MAX_PATH_LEN + 32]u8 = undefined;
-    const temp_path = std.fmt.bufPrint(&temp_buf, "{s}.tmp.{x}", .{path, std.crypto.random.int(u64)}) catch return IoError.PathTooLong;
+    const temp_path = std.fmt.bufPrint(&temp_buf, "{s}.tmp.{x}", .{ path, std.crypto.random.int(u64) }) catch return IoError.PathTooLong;
 
     const file = try createFilePath(temp_path, .{ .mode = IoConfig.SECURE_FILE_MODE });
     var file_closed = false;
