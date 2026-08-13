@@ -225,71 +225,6 @@ pub const PinnedMemory = struct {
     }
 };
 
-pub const FutharkArray1DF16 = struct {
-    arr: ?*futhark.struct_futhark_f16_1d,
-    len: usize,
-
-    const Self = @This();
-
-    pub fn newFromFlat(ctx: *FutharkContext, flat_data: []const f16, length: usize) AccelError!Self {
-        if (ctx.ctx == null) return AccelError.NullPointer;
-        if (length == 0) return AccelError.InvalidDimensions;
-        if (flat_data.len != length) return AccelError.InvalidDimensions;
-
-        const arr = futhark.futhark_new_f16_1d(
-            ctx.ctx,
-            @ptrCast(flat_data.ptr),
-            @intCast(length),
-        );
-        if (arr == null) return AccelError.FutharkArrayNewFailed;
-
-        return Self{ .arr = arr, .len = length };
-    }
-
-    pub fn newZeros(ctx: *FutharkContext, length: usize, allocator: std.mem.Allocator) AccelError!Self {
-        if (ctx.ctx == null) return AccelError.NullPointer;
-        if (length == 0) return AccelError.InvalidDimensions;
-
-        const zeros = allocator.alloc(f16, length) catch return AccelError.AllocationFailed;
-        defer allocator.free(zeros);
-        @memset(zeros, 0);
-
-        const arr = futhark.futhark_new_f16_1d(
-            ctx.ctx,
-            @ptrCast(zeros.ptr),
-            @intCast(length),
-        );
-        if (arr == null) return AccelError.FutharkArrayNewFailed;
-
-        return Self{ .arr = arr, .len = length };
-    }
-
-    pub fn values1D(self: *const Self, ctx: *FutharkContext, allocator: std.mem.Allocator) AccelError![]f16 {
-        if (ctx.ctx == null) return AccelError.NullPointer;
-        if (self.arr == null) return AccelError.NullPointer;
-        if (self.len == 0) return AccelError.InvalidDimensions;
-
-        const buf = allocator.alloc(f16, self.len) catch return AccelError.AllocationFailed;
-        errdefer allocator.free(buf);
-
-        const result = futhark.futhark_values_f16_1d(ctx.ctx, self.arr, @ptrCast(buf.ptr));
-        if (result != 0) return AccelError.FutharkValuesFailed;
-
-        const sync_result = futhark.futhark_context_sync(ctx.ctx);
-        if (sync_result != 0) return AccelError.FutharkSyncFailed;
-
-        return buf;
-    }
-
-    pub fn free(self: *Self, ctx: *FutharkContext) void {
-        if (self.arr) |arr| {
-            _ = futhark.futhark_free_f16_1d(ctx.ctx, arr);
-            self.arr = null;
-            self.len = 0;
-        }
-    }
-};
-
 pub const FutharkArray2DF16 = struct {
     arr: ?*futhark.struct_futhark_f16_2d,
     rows: usize,
@@ -2012,56 +1947,6 @@ pub const EmbeddingAccelerator = struct {
         }
         self.grad_weight.free(self.ctx);
         self.grad_weight = .{ .arr = scaled, .rows = self.vocab_size, .cols = self.dim };
-    }
-
-    pub fn forward(self: *Self, tokens: []const u32) AccelError!FutharkArray2DF16 {
-        if (!self.initialized) return AccelError.NullPointer;
-        if (self.ctx.ctx == null) return AccelError.NullPointer;
-
-        const token_i64s = if (tokens.len <= self.scratch_token_cap) self.scratch_token_buf[0..tokens.len] else (self.allocator.alloc(i64, tokens.len) catch return AccelError.AllocationFailed);
-        defer if (tokens.len > self.scratch_token_cap) self.allocator.free(token_i64s);
-        for (token_i64s, 0..) |*t, i| {
-            if (@as(usize, tokens[i]) >= self.vocab_size) return AccelError.InvalidToken;
-            t.* = @intCast(tokens[i]);
-        }
-
-        var tok_arr = try FutharkArray1DI64.newFromSlice(self.ctx, token_i64s);
-        defer tok_arr.free(self.ctx);
-
-        var out: ?*futhark.struct_futhark_f16_2d = null;
-        const rc = futhark.futhark_entry_embedding_forward(
-            self.ctx.ctx,
-            &out,
-            tok_arr.arr,
-            self.weight.arr,
-        );
-
-        if (rc != 0 or out == null) return AccelError.FutharkForwardFailed;
-        return FutharkArray2DF16{ .arr = out, .rows = tokens.len, .cols = self.dim };
-    }
-
-    pub fn backwardAccumulate(self: *Self, tokens: []const u32, grad_output: *FutharkArray2DF16) AccelError!void {
-        if (!self.initialized) return AccelError.NullPointer;
-        const token_i64s = if (tokens.len <= self.scratch_token_cap) self.scratch_token_buf[0..tokens.len] else (self.allocator.alloc(i64, tokens.len) catch return AccelError.AllocationFailed);
-        defer if (tokens.len > self.scratch_token_cap) self.allocator.free(token_i64s);
-        for (token_i64s, 0..) |*t, i| {
-            if (@as(usize, tokens[i]) >= self.vocab_size) return AccelError.InvalidToken;
-            t.* = @intCast(tokens[i]);
-        }
-        var tok_arr = try FutharkArray1DI64.newFromSlice(self.ctx, token_i64s);
-        defer tok_arr.free(self.ctx);
-        var new_grad: ?*futhark.struct_futhark_f32_2d = null;
-        const rc = futhark.futhark_entry_embedding_backward(
-            self.ctx.ctx,
-            &new_grad,
-            tok_arr.arr,
-            grad_output.arr,
-            self.grad_weight.arr,
-        );
-        if (rc != 0 or new_grad == null) return AccelError.FutharkBackwardFailed;
-        const old_grad = self.grad_weight.arr;
-        self.grad_weight.arr = new_grad;
-        _ = futhark.futhark_free_f32_2d(self.ctx.ctx, old_grad);
     }
 
     pub fn ensureFisherState(self: *Self) AccelError!void {

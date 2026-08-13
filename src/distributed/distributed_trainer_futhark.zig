@@ -5,7 +5,6 @@ const MGT = @import("../tokenizer/mgt.zig").MGT;
 const accel = @import("../hw/accel/accel_interface.zig");
 const RSFAccelerator = accel.RSFAccelerator;
 const FutharkArray2DF16 = accel.FutharkArray2DF16;
-const FutharkArray1DF16 = accel.FutharkArray1DF16;
 const FutharkArray3DF16 = accel.FutharkArray3DF16;
 const PinnedMemory = accel.PinnedMemory;
 const futhark = @import("../hw/accel/futhark_bindings.zig");
@@ -24,7 +23,6 @@ const Tensor = @import("../core/tensor.zig").Tensor;
 const sfd = @import("../optimizer/sfd.zig");
 
 const _use_futhark_2d = FutharkArray2DF16;
-const _use_futhark_1d = FutharkArray1DF16;
 const _use_tensor = Tensor;
 
 pub const CHECKPOINT_MAGIC: [8]u8 = .{ 'J', 'A', 'I', 'D', 'E', 'C', 'K', 'P' };
