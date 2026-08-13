@@ -32,6 +32,7 @@ const _use_futhark_1d = FutharkArray1DF16;
 const _use_tensor = Tensor;
 
 pub const CHECKPOINT_MAGIC: [8]u8 = .{ 'J', 'A', 'I', 'D', 'E', 'C', 'K', 'P' };
+pub const CHECKPOINT_VERSION: u32 = 6;
 pub const CHECKPOINT_TRAILER: u32 = 0xDEADBEEF;
 
 pub const sfd_fisher_gamma_default: f32 = 0.99;
@@ -141,9 +142,10 @@ fn loadTokenList(
 pub const TrainerConfig = struct {
     learning_rate: f32 = 0.001,
     momentum: f32 = 0.0,
+    optimizer_warmup_steps: u64 = 10,
     max_line_size: usize = 10 * 1024 * 1024,
     max_tokenizer_file_size: usize = 1024 * 1024 * 1024,
-    checkpoint_version: u32 = 5,
+    checkpoint_version: u32 = CHECKPOINT_VERSION,
     reasoning_cycles: usize = 1,
     fnds_max_depth: usize = 6,
     fnds_branching: usize = 4,
@@ -340,8 +342,6 @@ fn createConfiguredTokenizer(
 const LayerSnapshot = struct {
     weights_s: []f16,
     weights_t: []f16,
-    velocity_s: []f16,
-    velocity_t: []f16,
 };
 
 fn CrcTrackingWriter(comptime WriterType: type) type {
@@ -532,19 +532,24 @@ const CommBridge = struct {
         try ctx.syncLocked();
 
         if (trainer.coordinator.world_size > 1) {
-            const ws = try trainer.accelerator.getStackDevicePtr(.weights_s);
-            const wt = try trainer.accelerator.getStackDevicePtr(.weights_t);
+            const master_s = try trainer.accelerator.getStackDevicePtrF32(.master_weights_s);
+            const master_t = try trainer.accelerator.getStackDevicePtrF32(.master_weights_t);
             const mms = try trainer.accelerator.getStackDevicePtrF32(.momentum_s);
             const mmt = try trainer.accelerator.getStackDevicePtrF32(.momentum_t);
+            const fms = try trainer.accelerator.getStackDevicePtrF32(.fisher_s);
+            const fmt = try trainer.accelerator.getStackDevicePtrF32(.fisher_t);
             {
                 trainer.nccl_mutex.lock();
                 defer trainer.nccl_mutex.unlock();
-                try trainer.coordinator.allReduceFloat16Avg(ws.ptr, ws.ptr, ws.count);
-                try trainer.coordinator.allReduceFloat16Avg(wt.ptr, wt.ptr, wt.count);
+                try trainer.coordinator.allReduceFloat32Avg(master_s.ptr, master_s.ptr, master_s.count);
+                try trainer.coordinator.allReduceFloat32Avg(master_t.ptr, master_t.ptr, master_t.count);
                 try trainer.coordinator.allReduceFloat32Avg(mms.ptr, mms.ptr, mms.count);
                 try trainer.coordinator.allReduceFloat32Avg(mmt.ptr, mmt.ptr, mmt.count);
+                try trainer.coordinator.allReduceFloat32Avg(fms.ptr, fms.ptr, fms.count);
+                try trainer.coordinator.allReduceFloat32Avg(fmt.ptr, fmt.ptr, fmt.count);
                 try trainer.coordinator.synchronize();
             }
+            try trainer.accelerator.refreshForwardWeightsFromMaster();
         }
 
         if (job.apply_embedding_update) {
@@ -573,6 +578,10 @@ const CommBridge = struct {
         }
 
         if (job.apply_spectral) {
+            try trainer.accelerator.spectralNormalizeLayers(
+                trainer.config.spectral_target_norm,
+                trainer.config.spectral_iterations,
+            );
             try trainer.applyEmbeddingSpectralNormalization();
         }
 
@@ -727,7 +736,7 @@ pub const DistributedTrainerFuthark = struct {
         if (coordinator.world_size == 0) return TrainerError.InvalidWorldSize;
         if (coordinator.rank >= coordinator.world_size) return TrainerError.InvalidRank;
         if (config.max_line_size == 0) return TrainerError.InvalidMaxLineSize;
-        if (config.checkpoint_version == 0) return TrainerError.InvalidCheckpointVersion;
+        if (config.checkpoint_version != CHECKPOINT_VERSION) return TrainerError.InvalidCheckpointVersion;
         if (!std.math.isFinite(config.esso_initial_temperature) or config.esso_initial_temperature <= 0.0) return TrainerError.InvalidOptimizerConfiguration;
         if (!std.math.isFinite(config.esso_cooling_rate) or config.esso_cooling_rate <= 0.0 or config.esso_cooling_rate > 1.0) return TrainerError.InvalidOptimizerConfiguration;
         if (config.esso_max_iterations == 0) return TrainerError.InvalidOptimizerConfiguration;
@@ -753,12 +762,15 @@ pub const DistributedTrainerFuthark = struct {
             allocator,
             config.spectral_depth_compensation,
         );
+        var accelerator_committed = false;
+        errdefer if (!accelerator_committed) accelerator_ptr.deinit();
         try accelerator_ptr.setClipRange(
             try checkedF32ToF16(config.clip_min),
             try checkedF32ToF16(config.clip_max),
         );
-        var accelerator_committed = false;
-        errdefer if (!accelerator_committed) accelerator_ptr.deinit();
+        if (config.spectral_iterations > 0) {
+            try accelerator_ptr.spectralNormalizeLayers(config.spectral_target_norm, config.spectral_iterations);
+        }
 
         var gpu_embedding = try accel.EmbeddingAccelerator.init(
             allocator,
@@ -1464,47 +1476,10 @@ pub const DistributedTrainerFuthark = struct {
         return @intCast(result);
     }
 
-    fn applyLayerMatrix(
-        self: *DistributedTrainerFuthark,
-        layer_idx: usize,
-        base: []const f16,
-        delta: []const f16,
-        kind: accel.WeightKind,
-    ) !void {
-        if (base.len != delta.len) return TrainerError.InvalidWeightsShape;
-        const half = self.model_dim / 2;
-        const columns = try std.math.add(usize, half, 1);
-        const expected_length = try std.math.mul(usize, half, columns);
-        if (base.len != expected_length) return TrainerError.InvalidWeightsShape;
-
-        var merged = try self.allocator.alloc(f16, base.len);
-        defer self.allocator.free(merged);
-        for (base, delta, 0..) |base_value, delta_value, index| {
-            const merged_value = @as(f32, @floatCast(base_value)) + @as(f32, @floatCast(delta_value));
-            merged[index] = try checkedF32ToF16(merged_value);
-        }
-        switch (kind) {
-            .weights_s => try self.accelerator.setLayerWeightsS(layer_idx, merged, half, columns),
-            .weights_t => try self.accelerator.setLayerWeightsT(layer_idx, merged, half, columns),
-            .velocity_s => try self.accelerator.setLayerVelocityS(layer_idx, merged, half, columns),
-            .velocity_t => try self.accelerator.setLayerVelocityT(layer_idx, merged, half, columns),
-        }
-    }
-
-    fn subtractLayerSnapshot(current: []f16, original: []const f16) !void {
-        if (current.len != original.len) return TrainerError.InvalidWeightsShape;
-        for (current, original) |*current_value, original_value| {
-            const difference = @as(f32, @floatCast(current_value.*)) - @as(f32, @floatCast(original_value));
-            current_value.* = try checkedF32ToF16(difference);
-        }
-    }
-
     fn freeLayerSnapshots(self: *DistributedTrainerFuthark, snapshots: []LayerSnapshot) void {
         for (snapshots) |snapshot| {
             if (snapshot.weights_s.len > 0) self.allocator.free(snapshot.weights_s);
             if (snapshot.weights_t.len > 0) self.allocator.free(snapshot.weights_t);
-            if (snapshot.velocity_s.len > 0) self.allocator.free(snapshot.velocity_s);
-            if (snapshot.velocity_t.len > 0) self.allocator.free(snapshot.velocity_t);
         }
         self.allocator.free(snapshots);
     }
@@ -1512,67 +1487,15 @@ pub const DistributedTrainerFuthark = struct {
     fn captureLayerSnapshots(self: *DistributedTrainerFuthark) ![]LayerSnapshot {
         const snapshots = try self.allocator.alloc(LayerSnapshot, self.num_layers);
         errdefer self.allocator.free(snapshots);
-        for (snapshots) |*snapshot| {
-            snapshot.* = .{
-                .weights_s = &.{},
-                .weights_t = &.{},
-                .velocity_s = &.{},
-                .velocity_t = &.{},
-            };
-        }
+        for (snapshots) |*snapshot| snapshot.* = .{ .weights_s = &.{}, .weights_t = &.{} };
+        errdefer for (snapshots) |snapshot| {
+            if (snapshot.weights_s.len > 0) self.allocator.free(snapshot.weights_s);
+            if (snapshot.weights_t.len > 0) self.allocator.free(snapshot.weights_t);
+        };
+        try self.accelerator.syncLayersFromStack();
         for (snapshots, 0..) |*snapshot, layer_index| {
-            snapshot.weights_s = self.readLayerMatrix(layer_index, .weights_s) catch |err| {
-                var idx: usize = 0;
-                while (idx <= layer_index) : (idx += 1) {
-                    if (snapshots[idx].weights_s.len > 0) self.allocator.free(snapshots[idx].weights_s);
-                    if (snapshots[idx].weights_t.len > 0) self.allocator.free(snapshots[idx].weights_t);
-                    if (snapshots[idx].velocity_s.len > 0) self.allocator.free(snapshots[idx].velocity_s);
-                    if (snapshots[idx].velocity_t.len > 0) self.allocator.free(snapshots[idx].velocity_t);
-                }
-                return err;
-            };
-            snapshot.weights_t = self.readLayerMatrix(layer_index, .weights_t) catch |err| {
-                self.allocator.free(snapshot.weights_s);
-                snapshot.weights_s = &.{};
-                var idx: usize = 0;
-                while (idx < layer_index) : (idx += 1) {
-                    if (snapshots[idx].weights_s.len > 0) self.allocator.free(snapshots[idx].weights_s);
-                    if (snapshots[idx].weights_t.len > 0) self.allocator.free(snapshots[idx].weights_t);
-                    if (snapshots[idx].velocity_s.len > 0) self.allocator.free(snapshots[idx].velocity_s);
-                    if (snapshots[idx].velocity_t.len > 0) self.allocator.free(snapshots[idx].velocity_t);
-                }
-                return err;
-            };
-            snapshot.velocity_s = self.readLayerMatrix(layer_index, .velocity_s) catch |err| {
-                self.allocator.free(snapshot.weights_s);
-                self.allocator.free(snapshot.weights_t);
-                snapshot.weights_s = &.{};
-                snapshot.weights_t = &.{};
-                var idx: usize = 0;
-                while (idx < layer_index) : (idx += 1) {
-                    if (snapshots[idx].weights_s.len > 0) self.allocator.free(snapshots[idx].weights_s);
-                    if (snapshots[idx].weights_t.len > 0) self.allocator.free(snapshots[idx].weights_t);
-                    if (snapshots[idx].velocity_s.len > 0) self.allocator.free(snapshots[idx].velocity_s);
-                    if (snapshots[idx].velocity_t.len > 0) self.allocator.free(snapshots[idx].velocity_t);
-                }
-                return err;
-            };
-            snapshot.velocity_t = self.readLayerMatrix(layer_index, .velocity_t) catch |err| {
-                self.allocator.free(snapshot.weights_s);
-                self.allocator.free(snapshot.weights_t);
-                self.allocator.free(snapshot.velocity_s);
-                snapshot.weights_s = &.{};
-                snapshot.weights_t = &.{};
-                snapshot.velocity_s = &.{};
-                var idx: usize = 0;
-                while (idx < layer_index) : (idx += 1) {
-                    if (snapshots[idx].weights_s.len > 0) self.allocator.free(snapshots[idx].weights_s);
-                    if (snapshots[idx].weights_t.len > 0) self.allocator.free(snapshots[idx].weights_t);
-                    if (snapshots[idx].velocity_s.len > 0) self.allocator.free(snapshots[idx].velocity_s);
-                    if (snapshots[idx].velocity_t.len > 0) self.allocator.free(snapshots[idx].velocity_t);
-                }
-                return err;
-            };
+            snapshot.weights_s = try self.readLayerMatrix(layer_index, .weights_s);
+            snapshot.weights_t = try self.readLayerMatrix(layer_index, .weights_t);
         }
         return snapshots;
     }
@@ -2266,16 +2189,22 @@ pub const DistributedTrainerFuthark = struct {
         defer tensors.inputs.free(&self.accelerator.ctx);
         defer tensors.targets.free(&self.accelerator.ctx);
 
-        const effective_learning_rate = self.learning_rate * self.vpu_lr_scale;
+        const completed_step = std.math.add(u64, self.global_step, 1) catch return TrainerError.ValueOverflow;
+        const warmup_factor: f32 = if (self.config.optimizer_warmup_steps > 0 and completed_step < self.config.optimizer_warmup_steps)
+            @as(f32, @floatFromInt(completed_step)) / @as(f32, @floatFromInt(self.config.optimizer_warmup_steps))
+        else
+            1.0;
+        const effective_learning_rate = self.learning_rate * self.vpu_lr_scale * warmup_factor;
         const clamped_learning_rate: f32 = if (effective_learning_rate > 65504.0)
             65504.0
         else if (effective_learning_rate <= 0.0)
-            self.learning_rate
+            self.learning_rate * warmup_factor
         else
             effective_learning_rate;
-        const learning_rate = try checkedF32ToF16(clamped_learning_rate);
-        const momentum = try checkedF32ToF16(self.momentum);
-        const completed_step = std.math.add(u64, self.global_step, 1) catch return TrainerError.ValueOverflow;
+        // Optimizer hyperparameters remain f32 all the way into the fused
+        // kernel; only the forward-weight mirror is f16.
+        const learning_rate = clamped_learning_rate;
+        const momentum = self.momentum;
         const report_progress = self.coordinator.isRoot() and (completed_step <= 50 or completed_step % 10 == 0);
         const step_t0_ns = std.time.nanoTimestamp();
         if (report_progress) {
@@ -2603,6 +2532,8 @@ pub const DistributedTrainerFuthark = struct {
         clip_min_f32: f32,
         clip_max_f32: f32,
         layers: []LayerSnapshot,
+        rsf_optimizer_state: accel.RSFOptimizerState,
+        embedding_optimizer_state: ?accel.EmbeddingOptimizerState,
         embedding_vocab: usize,
         embedding_dim: usize,
         embedding_weights: []f16,
@@ -2618,10 +2549,10 @@ pub const DistributedTrainerFuthark = struct {
             for (self.layers) |layer| {
                 if (layer.weights_s.len > 0) self.allocator.free(layer.weights_s);
                 if (layer.weights_t.len > 0) self.allocator.free(layer.weights_t);
-                if (layer.velocity_s.len > 0) self.allocator.free(layer.velocity_s);
-                if (layer.velocity_t.len > 0) self.allocator.free(layer.velocity_t);
             }
             self.allocator.free(self.layers);
+            self.rsf_optimizer_state.deinit();
+            if (self.embedding_optimizer_state) |*state| state.deinit();
             if (self.embedding_weights.len > 0) self.allocator.free(self.embedding_weights);
             if (self.target_weights.len > 0) self.allocator.free(self.target_weights);
             self.allocator.free(self.training_graph_bytes);
@@ -2650,6 +2581,10 @@ pub const DistributedTrainerFuthark = struct {
 
         const layer_snapshots = try self.captureLayerSnapshots();
         errdefer self.freeLayerSnapshots(layer_snapshots);
+        var rsf_optimizer_state = try self.accelerator.readOptimizerState(self.allocator);
+        errdefer rsf_optimizer_state.deinit();
+        var embedding_optimizer_state: ?accel.EmbeddingOptimizerState = null;
+        errdefer if (embedding_optimizer_state) |*state| state.deinit();
 
         const clip_min_f32: f32 = @floatCast(self.accelerator.clip_min);
         const clip_max_f32: f32 = @floatCast(self.accelerator.clip_max);
@@ -2678,6 +2613,7 @@ pub const DistributedTrainerFuthark = struct {
             for (weight_f16_save) |w| {
                 if (!std.math.isFinite(@as(f32, @floatCast(w)))) return TrainerError.InvalidWeightValue;
             }
+            embedding_optimizer_state = try emb.readOptimizerState(self.allocator);
         }
 
         var target_vocab: usize = 0;
@@ -2732,6 +2668,8 @@ pub const DistributedTrainerFuthark = struct {
             .clip_min_f32 = clip_min_f32,
             .clip_max_f32 = clip_max_f32,
             .layers = layer_snapshots,
+            .rsf_optimizer_state = rsf_optimizer_state,
+            .embedding_optimizer_state = embedding_optimizer_state,
             .embedding_vocab = embedding_vocab,
             .embedding_dim = embedding_dim,
             .embedding_weights = embedding_weights,
@@ -2795,13 +2733,23 @@ pub const DistributedTrainerFuthark = struct {
                 try writer.writeInt(u64, @as(u64, layer.weights_t.len), .little);
                 for (layer.weights_t) |w| try writeF32(writer, @floatCast(w));
 
-                for (layer.velocity_s) |v| if (!std.math.isFinite(@as(f32, @floatCast(v)))) return TrainerError.InvalidWeightValue;
-                try writer.writeInt(u64, @as(u64, layer.velocity_s.len), .little);
-                for (layer.velocity_s) |v| try writeF32(writer, @floatCast(v));
+            }
 
-                for (layer.velocity_t) |v| if (!std.math.isFinite(@as(f32, @floatCast(v)))) return TrainerError.InvalidWeightValue;
-                try writer.writeInt(u64, @as(u64, layer.velocity_t.len), .little);
-                for (layer.velocity_t) |v| try writeF32(writer, @floatCast(v));
+            try writer.writeInt(u64, snapshot.rsf_optimizer_state.step, .little);
+            const rsf_state_arrays = [_][]const f32{
+                snapshot.rsf_optimizer_state.master_weights_s,
+                snapshot.rsf_optimizer_state.master_weights_t,
+                snapshot.rsf_optimizer_state.momentum_s,
+                snapshot.rsf_optimizer_state.momentum_t,
+                snapshot.rsf_optimizer_state.fisher_s,
+                snapshot.rsf_optimizer_state.fisher_t,
+            };
+            for (rsf_state_arrays) |values| {
+                try writer.writeInt(u64, @intCast(values.len), .little);
+                for (values) |value| {
+                    if (!std.math.isFinite(value)) return TrainerError.InvalidWeightValue;
+                    try writeF32(writer, value);
+                }
             }
 
             try writeF32(writer, snapshot.clip_min_f32);
@@ -2817,10 +2765,19 @@ pub const DistributedTrainerFuthark = struct {
                     if (!std.math.isFinite(wf32)) return TrainerError.InvalidEmbeddingWeight;
                     try writeF32(writer, wf32);
                 }
-                try writer.writeInt(u64, @as(u64, snapshot.embedding_weights.len), .little);
-                var zi: usize = 0;
-                while (zi < snapshot.embedding_weights.len) : (zi += 1) {
-                    try writeF32(writer, 0.0);
+                const embedding_state = snapshot.embedding_optimizer_state orelse return TrainerError.CheckpointSaveFailed;
+                try writer.writeInt(u64, embedding_state.step, .little);
+                try writer.writeInt(u64, @intCast(embedding_state.master_weights.len), .little);
+                for (embedding_state.master_weights) |value| {
+                    if (!std.math.isFinite(value)) return TrainerError.InvalidWeightValue;
+                    try writeF32(writer, value);
+                }
+                try writer.writeInt(u64, @intCast(embedding_state.momentum.len), .little);
+                for (embedding_state.momentum) |value| try writeF32(writer, value);
+                try writer.writeInt(u64, @intCast(embedding_state.fisher.len), .little);
+                for (embedding_state.fisher) |value| {
+                    if (!std.math.isFinite(value) or value < 0.0) return TrainerError.InvalidWeightValue;
+                    try writeF32(writer, value);
                 }
             } else {
                 try writer.writeByte(0);
@@ -2877,6 +2834,19 @@ pub const DistributedTrainerFuthark = struct {
             const v = try readF32(reader);
             if (!std.math.isFinite(v)) return TrainerError.InvalidWeightValue;
             values[i] = try checkedF32ToF16(v);
+        }
+        return values;
+    }
+
+    fn readCheckpointF32Array(self: *DistributedTrainerFuthark, reader: anytype, expected_length: usize, nonnegative: bool) ![]f32 {
+        const saved_length_u64 = try reader.readInt(u64, .little);
+        const saved_length = std.math.cast(usize, saved_length_u64) orelse return TrainerError.InvalidWeightsShape;
+        if (saved_length != expected_length) return TrainerError.InvalidWeightsShape;
+        const values = try self.allocator.alloc(f32, saved_length);
+        errdefer self.allocator.free(values);
+        for (values) |*value| {
+            value.* = try readF32(reader);
+            if (!std.math.isFinite(value.*) or (nonnegative and value.* < 0.0)) return TrainerError.InvalidWeightValue;
         }
         return values;
     }
@@ -2941,59 +2911,29 @@ pub const DistributedTrainerFuthark = struct {
             for (snapshots) |snapshot| {
                 if (snapshot.weights_s.len > 0) self.allocator.free(snapshot.weights_s);
                 if (snapshot.weights_t.len > 0) self.allocator.free(snapshot.weights_t);
-                if (snapshot.velocity_s.len > 0) self.allocator.free(snapshot.velocity_s);
-                if (snapshot.velocity_t.len > 0) self.allocator.free(snapshot.velocity_t);
             }
             self.allocator.free(snapshots);
         };
+        for (snapshots) |*snapshot| snapshot.* = .{ .weights_s = &.{}, .weights_t = &.{} };
         for (snapshots) |*snapshot| {
-            snapshot.* = .{ .weights_s = &.{}, .weights_t = &.{}, .velocity_s = &.{}, .velocity_t = &.{} };
-        }
-        for (snapshots, 0..) |*snapshot, layer_index| {
             snapshot.weights_s = try self.readCheckpointF16Array(reader, expected_length);
-            snapshot.weights_t = self.readCheckpointF16Array(reader, expected_length) catch |err| {
-                self.allocator.free(snapshot.weights_s);
-                snapshot.weights_s = &.{};
-                var idx: usize = 0;
-                while (idx < layer_index) : (idx += 1) {
-                    if (snapshots[idx].weights_s.len > 0) self.allocator.free(snapshots[idx].weights_s);
-                    if (snapshots[idx].weights_t.len > 0) self.allocator.free(snapshots[idx].weights_t);
-                    if (snapshots[idx].velocity_s.len > 0) self.allocator.free(snapshots[idx].velocity_s);
-                    if (snapshots[idx].velocity_t.len > 0) self.allocator.free(snapshots[idx].velocity_t);
-                }
-                return err;
-            };
-            snapshot.velocity_s = self.readCheckpointF16Array(reader, expected_length) catch |err| {
-                self.allocator.free(snapshot.weights_s);
-                self.allocator.free(snapshot.weights_t);
-                snapshot.weights_s = &.{};
-                snapshot.weights_t = &.{};
-                var idx: usize = 0;
-                while (idx < layer_index) : (idx += 1) {
-                    if (snapshots[idx].weights_s.len > 0) self.allocator.free(snapshots[idx].weights_s);
-                    if (snapshots[idx].weights_t.len > 0) self.allocator.free(snapshots[idx].weights_t);
-                    if (snapshots[idx].velocity_s.len > 0) self.allocator.free(snapshots[idx].velocity_s);
-                    if (snapshots[idx].velocity_t.len > 0) self.allocator.free(snapshots[idx].velocity_t);
-                }
-                return err;
-            };
-            snapshot.velocity_t = self.readCheckpointF16Array(reader, expected_length) catch |err| {
-                self.allocator.free(snapshot.weights_s);
-                self.allocator.free(snapshot.weights_t);
-                self.allocator.free(snapshot.velocity_s);
-                snapshot.weights_s = &.{};
-                snapshot.weights_t = &.{};
-                snapshot.velocity_s = &.{};
-                var idx: usize = 0;
-                while (idx < layer_index) : (idx += 1) {
-                    if (snapshots[idx].weights_s.len > 0) self.allocator.free(snapshots[idx].weights_s);
-                    if (snapshots[idx].weights_t.len > 0) self.allocator.free(snapshots[idx].weights_t);
-                    if (snapshots[idx].velocity_s.len > 0) self.allocator.free(snapshots[idx].velocity_s);
-                    if (snapshots[idx].velocity_t.len > 0) self.allocator.free(snapshots[idx].velocity_t);
-                }
-                return err;
-            };
+            snapshot.weights_t = try self.readCheckpointF16Array(reader, expected_length);
         }
+
+        const saved_rsf_optimizer_step = try reader.readInt(u64, .little);
+        const total_rsf_state = try std.math.mul(usize, expected_length, self.num_layers);
+        const saved_master_weights_s = try self.readCheckpointF32Array(reader, total_rsf_state, false);
+        defer self.allocator.free(saved_master_weights_s);
+        const saved_master_weights_t = try self.readCheckpointF32Array(reader, total_rsf_state, false);
+        defer self.allocator.free(saved_master_weights_t);
+        const saved_momentum_s = try self.readCheckpointF32Array(reader, total_rsf_state, false);
+        defer self.allocator.free(saved_momentum_s);
+        const saved_momentum_t = try self.readCheckpointF32Array(reader, total_rsf_state, false);
+        defer self.allocator.free(saved_momentum_t);
+        const saved_fisher_s = try self.readCheckpointF32Array(reader, total_rsf_state, true);
+        defer self.allocator.free(saved_fisher_s);
+        const saved_fisher_t = try self.readCheckpointF32Array(reader, total_rsf_state, true);
+        defer self.allocator.free(saved_fisher_t);
 
         const clip_min_f32 = try readF32(reader);
         const clip_max_f32 = try readF32(reader);
@@ -3006,9 +2946,16 @@ pub const DistributedTrainerFuthark = struct {
         if (has_embedding > 1) return TrainerError.InvalidCheckpointEmbeddingFlag;
 
         var pending_emb_weight: ?[]f16 = null;
+        var pending_emb_master: ?[]f32 = null;
+        var pending_emb_momentum: ?[]f32 = null;
+        var pending_emb_fisher: ?[]f32 = null;
+        var pending_emb_step: u64 = 0;
         var pending_emb_vocab: usize = 0;
         var pending_emb_dim: usize = 0;
         defer if (pending_emb_weight) |w| self.allocator.free(w);
+        defer if (pending_emb_master) |values| self.allocator.free(values);
+        defer if (pending_emb_momentum) |values| self.allocator.free(values);
+        defer if (pending_emb_fisher) |values| self.allocator.free(values);
 
         if (has_embedding == 1) {
             const embedding_vocab_u64 = try reader.readInt(u64, .little);
@@ -3033,14 +2980,10 @@ pub const DistributedTrainerFuthark = struct {
                 if (v < -65504.0 or v > 65504.0) return TrainerError.InvalidEmbeddingWeight;
                 value.* = @floatCast(v);
             }
-            const vel_len_u64 = try reader.readInt(u64, .little);
-            const vel_len = std.math.cast(usize, vel_len_u64) orelse return TrainerError.InvalidEmbeddingShape;
-            if (vel_len != total_w) return TrainerError.InvalidEmbeddingShape;
-            var vel_idx: usize = 0;
-            while (vel_idx < vel_len) : (vel_idx += 1) {
-                const v = try readF32(reader);
-                if (!std.math.isFinite(v)) return TrainerError.InvalidEmbeddingWeight;
-            }
+            pending_emb_step = try reader.readInt(u64, .little);
+            pending_emb_master = try self.readCheckpointF32Array(reader, total_w, false);
+            pending_emb_momentum = try self.readCheckpointF32Array(reader, total_w, false);
+            pending_emb_fisher = try self.readCheckpointF32Array(reader, total_w, true);
             pending_emb_weight = weight_buf;
             pending_emb_vocab = embedding_vocab;
             pending_emb_dim = embedding_dim;
@@ -3148,9 +3091,16 @@ pub const DistributedTrainerFuthark = struct {
         for (snapshots, 0..) |snapshot, layer_index| {
             try new_accelerator_ptr.setLayerWeightsS(layer_index, snapshot.weights_s, half, columns);
             try new_accelerator_ptr.setLayerWeightsT(layer_index, snapshot.weights_t, half, columns);
-            try new_accelerator_ptr.setLayerVelocityS(layer_index, snapshot.velocity_s, half, columns);
-            try new_accelerator_ptr.setLayerVelocityT(layer_index, snapshot.velocity_t, half, columns);
         }
+        try new_accelerator_ptr.setOptimizerState(
+            saved_master_weights_s,
+            saved_master_weights_t,
+            saved_momentum_s,
+            saved_momentum_t,
+            saved_fisher_s,
+            saved_fisher_t,
+            saved_rsf_optimizer_step,
+        );
         try new_accelerator_ptr.setClipRange(clip_min, clip_max);
         try new_accelerator_ptr.sync();
 
@@ -3166,6 +3116,12 @@ pub const DistributedTrainerFuthark = struct {
                 pending_emb_vocab,
                 pending_emb_dim,
                 wf16,
+            );
+            try loaded_gpu_embedding.?.setOptimizerState(
+                pending_emb_master orelse return TrainerError.CheckpointCorrupted,
+                pending_emb_momentum orelse return TrainerError.CheckpointCorrupted,
+                pending_emb_fisher orelse return TrainerError.CheckpointCorrupted,
+                pending_emb_step,
             );
         }
 

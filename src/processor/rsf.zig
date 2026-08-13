@@ -1222,8 +1222,7 @@ fn backwardLogDetOnCore(core: *RSFCore, grad_output: *const Tensor, input: *cons
 fn layerGPUCompatible(layer: *const LayerCore, cfg: *const RSFConfig, dim: usize) bool {
     if (layer.dim != dim) return false;
     if (layer.clip_min != cfg.clip_min or layer.clip_max != cfg.clip_max or layer.grad_mean != cfg.grad_mean) return false;
-    if (layer.clip_min != -5.0 or layer.clip_max != 5.0) return false;
-    return true;
+    return std.math.isFinite(layer.clip_min) and std.math.isFinite(layer.clip_max) and layer.clip_min < layer.clip_max;
 }
 
 fn modelGPUCompatible(core: *const RSFCore) bool {

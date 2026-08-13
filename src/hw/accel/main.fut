@@ -4,6 +4,11 @@ let matmul_f16 [m][n][k] (a: [m][k]f16) (b: [k][n]f16) : *[m][n]f16 =
     map (\b_col ->
       f16.sum (map2 (f16.*) a_row b_col)) bt) a
 
+
+entry matmul [m][n][k] (a: [m][k]f32) (b: [k][n]f32): *[m][n]f32 =
+  let bt = transpose b
+  in map (\a_row -> map (\b_col -> f32.sum (map2 (*) a_row b_col)) bt) a
+
 let oftb_scale_f32 : f32 = 0.7071067811865476
 
 let clamp_f16_value (v: f32) : f32 =
@@ -72,81 +77,56 @@ entry rsf_backward [n][half] (input: [n][half*2]f16) (grad_output: [n][half*2]f1
     in inner ++ [bias] :> [half+1]f16) dy2_t (map f16.sum dy2_t)
   in (copy acc_ws, copy acc_wt)
 
-entry sfd_update_mat [d][e] (weights: [d][e]f16) (gradients: [d][e]f16) (learning_rate: f16) (momentum: f16) (velocity: [d][e]f16) : (*[d][e]f16, *[d][e]f16) =
-  let new_velocity = map2 (map2 (\v g ->
-    let vf = f32.f16 v
-    let gf = f32.f16 g
-    let safe_v = if f32.isnan vf || f32.isinf vf then 0f32 else vf
-    let safe_g = if f32.isnan gf || f32.isinf gf then 0f32 else f32.max (-1f32) (f32.min 1f32 gf)
-    let next = f32.f16 momentum * safe_v + f32.f16 learning_rate * safe_g
-    in f16.f32 (clamp_f16_weight next))) velocity gradients
-  let new_weights = map2 (map2 (\w v ->
-    let wf = f32.f16 w
-    let vf = f32.f16 v
-    let safe_w = if f32.isnan wf || f32.isinf wf then 0f32 else wf
-    let safe_v = if f32.isnan vf || f32.isinf vf then 0f32 else vf
-    in f16.f32 (clamp_f16_value (safe_w - safe_v)))) weights (copy new_velocity)
-  in (new_weights, new_velocity)
-
-entry sfd_update_all_layers [num_layers][d][e] (weights: *[num_layers][d][e]f16) (gradients: [num_layers][d][e]f16) (learning_rate: f16) (momentum: f16) (velocity: *[num_layers][d][e]f16) : (*[num_layers][d][e]f16, *[num_layers][d][e]f16) =
-   let updates = map3 (\ws gs vs ->
-    let (new_ws, new_vs) = sfd_update_mat ws gs learning_rate momentum vs
-    in (new_ws, new_vs)) weights gradients velocity
-  let new_weights = map (\(w,_) -> w) updates
-  let new_velocity = map (\(_,v) -> v) updates
-  in (new_weights, new_velocity)
-
 let sfd_fisher_update_core [d][e]
-  (weights: [d][e]f16) (gradients: [d][e]f32)
+  (weights: [d][e]f32) (gradients: [d][e]f32)
   (momentum_state: [d][e]f32) (fisher_state: [d][e]f32)
-  (learning_rate: f32) (momentum_beta: f32) (fisher_gamma: f32) (epsilon: f32)
-  : ([d][e]f16, [d][e]f32, [d][e]f32) =
+  (learning_rate: f32) (momentum_beta: f32) (fisher_gamma: f32)
+  (optimizer_step: i64) (epsilon: f32)
+  : ([d][e]f32, [d][e]f32, [d][e]f32) =
   let safe_beta = f32.max 0f32 (f32.min 0.99999f32 momentum_beta)
   let safe_gamma = f32.max 0f32 (f32.min 0.99999f32 fisher_gamma)
   let safe_eps = f32.max epsilon 1e-12f32
-  let gradients_copy = copy gradients
+  let step_f = f32.i64 (i64.max 1 optimizer_step)
+  let momentum_correction = f32.max safe_eps (1f32 - safe_beta f32.** step_f)
+  let fisher_correction = f32.max safe_eps (1f32 - safe_gamma f32.** step_f)
   let momentum_next = map2 (map2 (\m g ->
-    let safe_g = if f32.isnan g || f32.isinf g then 0f32 else g
-    in safe_beta * m + safe_g)) momentum_state gradients_copy
+    if f32.isnan g || f32.isinf g then m
+    else
+      let candidate = safe_beta * m + (1f32 - safe_beta) * g
+      in if f32.isnan candidate || f32.isinf candidate then m else candidate)) momentum_state gradients
   let fisher_next = map2 (map2 (\f g ->
-    let safe_g = if f32.isnan g || f32.isinf g then 0f32 else g
-    in safe_gamma * f + (1f32 - safe_gamma) * safe_g * safe_g)) fisher_state gradients_copy
-  let weights_next = map3 (map3 (\w m f ->
-    let wf = f32.f16 w
-    let safe_w = if f32.isnan wf || f32.isinf wf then 0f32 else wf
-    let step = learning_rate * m / (f32.sqrt (f32.max f 0f32) + safe_eps)
-    in f16.f32 (clamp_f16_weight (safe_w - step)))) weights momentum_next fisher_next
+    if f32.isnan g || f32.isinf g then f
+    else
+      let candidate = safe_gamma * f + (1f32 - safe_gamma) * g * g
+      in if f32.isnan candidate || f32.isinf candidate then f else f32.min 1e6f32 candidate)) fisher_state gradients
+  let weights_next = map4 (map4 (\w g m f ->
+    let safe_w = if f32.isnan w || f32.isinf w then 0f32 else w
+    let m_hat = m / momentum_correction
+    let f_hat = f / fisher_correction
+    let raw_step = learning_rate * m_hat / (f32.sqrt (f32.max f_hat 0f32) + safe_eps)
+    let max_step = 0.1f32 * f32.max 1e-3f32 (f32.abs safe_w)
+    let clipped_step = f32.max (-max_step) (f32.min max_step raw_step)
+    in if f32.isnan g || f32.isinf g
+       then w
+       else clamp_f16_weight (safe_w - clipped_step))) weights gradients momentum_next fisher_next
   in (copy weights_next, copy momentum_next, copy fisher_next)
 
-entry sfd_update_mat_fisher [d][e]
-  (weights: *[d][e]f16) (gradients: [d][e]f32)
-  (learning_rate: f32) (momentum_beta: f32) (fisher_gamma: f32) (epsilon: f32)
-  (momentum_state: *[d][e]f32) (fisher_state: *[d][e]f32)
-  : ([d][e]f16, [d][e]f32, [d][e]f32) =
-  sfd_fisher_update_core weights gradients momentum_state fisher_state learning_rate momentum_beta fisher_gamma epsilon
+entry master_weights_to_f16_3d [layers][rows][columns] (weights: [layers][rows][columns]f32): *[layers][rows][columns]f16 =
+  map (map (map (\value -> f16.f32 (clamp_f16_weight value)))) weights
 
-entry sfd_update_all_layers_fisher [num_layers][d][e]
-  (weights: *[num_layers][d][e]f16) (gradients: [num_layers][d][e]f32)
-  (learning_rate: f32) (momentum_beta: f32) (fisher_gamma: f32) (epsilon: f32)
-  (momentum_state: *[num_layers][d][e]f32) (fisher_state: *[num_layers][d][e]f32)
-  : (*[num_layers][d][e]f16, *[num_layers][d][e]f32, *[num_layers][d][e]f32) =
-  let updates = map4 (\w g m f ->
-    sfd_fisher_update_core w g m f learning_rate momentum_beta fisher_gamma epsilon
-  ) weights gradients momentum_state fisher_state
-  let new_weights = map (\(w,_,_) -> w) updates
-  let new_momentum = map (\(_,m,_) -> m) updates
-  let new_fisher = map (\(_,_,f) -> f) updates
-  in (new_weights, new_momentum, new_fisher)
+entry master_weights_to_f16_2d [rows][columns] (weights: [rows][columns]f32): *[rows][columns]f16 =
+  map (map (\value -> f16.f32 (clamp_f16_weight value))) weights
 
-entry embedding_update_sfd [vocab_size][dim]
-  (weight: *[vocab_size][dim]f16) (grad_weight: [vocab_size][dim]f16)
+entry forward_weights_to_f32_2d [rows][columns] (weights: [rows][columns]f16): *[rows][columns]f32 =
+  map (map f32.f16) weights
+
+entry embedding_update_sfd_master [vocab_size][dim]
+  (master_weight: *[vocab_size][dim]f32) (grad_weight: [vocab_size][dim]f16)
   (momentum_state: *[vocab_size][dim]f32) (fisher_state: *[vocab_size][dim]f32)
-  (learning_rate: f32) (momentum_beta: f32) (fisher_gamma: f32) (epsilon: f32)
-  : ([vocab_size][dim]f16, [vocab_size][dim]f32, [vocab_size][dim]f32) =
-  let grad_f32 = map (map (\g ->
-    let gf = f32.f16 g
-    in if f32.isnan gf || f32.isinf gf then 0f32 else gf)) grad_weight
-  in sfd_fisher_update_core weight grad_f32 momentum_state fisher_state learning_rate momentum_beta fisher_gamma epsilon
+  (learning_rate: f32) (momentum_beta: f32) (fisher_gamma: f32) (optimizer_step: i64) (epsilon: f32)
+  : ([vocab_size][dim]f32, [vocab_size][dim]f32, [vocab_size][dim]f32) =
+  let grad_f32 = map (map f32.f16) grad_weight
+  in sfd_fisher_update_core master_weight grad_f32 momentum_state fisher_state learning_rate momentum_beta fisher_gamma optimizer_step epsilon
 
 entry compute_loss [n][d] (output: [n][d]f16) (target: [n][d]f16) : f16 =
   let squared_diff = map2 (map2 (\o t -> (o f16.- t) f16.* (o f16.- t))) output target
@@ -312,27 +292,6 @@ entry scale_matrix_f16 [rows][columns] (values: *[rows][columns]f16) (scale_fact
 entry accumulate_gradients [d] (grad1: *[d][d]f16) (grad2: [d][d]f16) : *[d][d]f16 =
   map2 (map2 (f16.+)) grad1 grad2
 
-entry training_step [batch_size][seq_len][half]
-  (inputs: [batch_size][seq_len][half*2]f16)
-  (targets: [batch_size][seq_len][half*2]f16)
-  (weights_s: *[half][half+1]f16)
-  (weights_t: *[half][half+1]f16)
-  (velocity_s: *[half][half+1]f16)
-  (velocity_t: *[half][half+1]f16)
-  (learning_rate: f16)
-  (momentum: f16)
-  (clip_min: f16)
-  (clip_max: f16) : (*[half][half+1]f16, *[half][half+1]f16, *[half][half+1]f16, *[half][half+1]f16, f16) =
-  let outputs = batch_forward inputs weights_s weights_t clip_min clip_max
-  let loss = batch_compute_loss outputs targets
-  let grad_outputs = map2 (map2 (map2 (\o t -> (f16.f32 2.0) f16.* (o f16.- t)))) outputs targets
-  let (grad_s, grad_t) = batch_gradients inputs grad_outputs weights_s weights_t clip_min clip_max
-  let grad_s_c = copy grad_s
-  let grad_t_c = copy grad_t
-  let (new_weights_s, new_velocity_s) = sfd_update_mat weights_s grad_s_c learning_rate momentum velocity_s
-  let (new_weights_t, new_velocity_t) = sfd_update_mat weights_t grad_t_c learning_rate momentum velocity_t
-  in (new_weights_s, new_weights_t, new_velocity_s, new_velocity_t, loss)
-
 let oftb_scale : f16 = f16.f32 0.7071067811865476
 
 entry oftb_forward_single [seq_len][dim] (input: [seq_len][dim]f16) : *[seq_len][dim]f16 =
@@ -438,9 +397,6 @@ entry embedding_backward_padded [n][batch_size][seq_len][dim][vocab_size]
   let safe_tokens = map (\t -> if t >= 0 && t < vocab_size then t else 0) valid_tokens_unclamped
   let updates = hist (map2 (f16.+)) (replicate dim (f16.i32 0)) vocab_size safe_tokens valid_grads
   in map2 (map2 (f16.+)) grad_weight updates
-
-entry embedding_update [vocab_size][dim] (weight: *[vocab_size][dim]f16) (grad_weight: [vocab_size][dim]f16) (lr: f16) : *[vocab_size][dim]f16 =
-  map2 (map2 (\w g -> w f16.- lr f16.* g)) weight grad_weight
 
 entry embedding_spectral_normalize [vocab_size][dim]
   (weight: *[vocab_size][dim]f16)
@@ -673,6 +629,8 @@ entry rsf_stack_backward_sfd_fused [batch_size][seq_len][half][num_layers]
   (lengths: [batch_size]i64)
   (weights_s: *[num_layers][half][half+1]f16)
   (weights_t: *[num_layers][half][half+1]f16)
+  (master_weights_s: *[num_layers][half][half+1]f32)
+  (master_weights_t: *[num_layers][half][half+1]f32)
   (momentum_s: *[num_layers][half][half+1]f32)
   (momentum_t: *[num_layers][half][half+1]f32)
   (fisher_s: *[num_layers][half][half+1]f32)
@@ -680,13 +638,14 @@ entry rsf_stack_backward_sfd_fused [batch_size][seq_len][half][num_layers]
   (learning_rate: f32)
   (momentum_beta: f32)
   (fisher_gamma: f32)
+  (optimizer_step: i64)
   (epsilon: f32)
   (clip_min: f32)
   (clip_max: f32)
   (reconstruction_alpha: f32)
   (forward_scale: f32)
   (logdet_weight: f32)
-  : (*[num_layers][half][half+1]f16, *[num_layers][half][half+1]f16,
+  : (*[num_layers][half][half+1]f32, *[num_layers][half][half+1]f32,
      *[num_layers][half][half+1]f32, *[num_layers][half][half+1]f32,
      *[num_layers][half][half+1]f32, *[num_layers][half][half+1]f32,
      *[batch_size][seq_len][half*2]f16,
@@ -800,18 +759,18 @@ entry rsf_stack_backward_sfd_fused [batch_size][seq_len][half][num_layers]
     ) g_stack x_stack flat_orig active_flags
   let input_delta_3d = unflatten input_delta :> [batch_size][seq_len][half*2]f16
   let s_updates = map4 (\w g m f ->
-    sfd_fisher_update_core w g m f learning_rate momentum_beta fisher_gamma epsilon
-    ) weights_s gs_mean momentum_s fisher_s
+    sfd_fisher_update_core w g m f learning_rate momentum_beta fisher_gamma optimizer_step epsilon
+    ) master_weights_s gs_mean momentum_s fisher_s
   let t_updates = map4 (\w g m f ->
-    sfd_fisher_update_core w g m f learning_rate momentum_beta fisher_gamma epsilon
-    ) weights_t gt_mean momentum_t fisher_t
-  let new_weights_s = map (\(w,_,_) -> w) s_updates
+    sfd_fisher_update_core w g m f learning_rate momentum_beta fisher_gamma optimizer_step epsilon
+    ) master_weights_t gt_mean momentum_t fisher_t
+  let new_master_weights_s = map (\(w,_,_) -> w) s_updates
   let new_momentum_s = map (\(_,m,_) -> m) s_updates
   let new_fisher_s = map (\(_,_,f) -> f) s_updates
-  let new_weights_t = map (\(w,_,_) -> w) t_updates
+  let new_master_weights_t = map (\(w,_,_) -> w) t_updates
   let new_momentum_t = map (\(_,m,_) -> m) t_updates
   let new_fisher_t = map (\(_,_,f) -> f) t_updates
-  in (new_weights_s, new_weights_t,
+  in (new_master_weights_s, new_master_weights_t,
       new_momentum_s, new_momentum_t,
       new_fisher_s, new_fisher_t,
       input_delta_3d,
