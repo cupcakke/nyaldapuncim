@@ -1,0 +1,1185 @@
+ne írj semmi mást csak a teljes fájlokat es kommentek nem lehetnek benne! soha semmi egyszerusitett mock placeholder dummy szimulalt fake szart nem engedelyezek es teljes fájl roviditetlen production ready kód nem lehet trancutted nem lehet olyan hogy …és hasonlóan 50 xy nem lehet dummy to do sorry hiányosság minden fájl teljes kódját egyesével fájkba írod semmi mást nem írsz ezen kívűl 
+
+I want to perform a verified, whole-path static audit and complete production upgrade of the JAIDE training system so that the current Zig/Futhark implementation trains reliably and efficiently on NVIDIA B200 hardware, preserves the defining RSF architecture and all of its mathematical guarantees, retains optimizer state correctly across every update and checkpoint boundary, removes all mock, dummy, placeholder, simulated, dead, and internally inconsistent production components, and produces complete, compilable, tested, production-ready source code with no omissions.
+
+Success means all of the following conditions are satisfied:
+
+1. The RSF architecture remains structurally outside perceptron, CNN, RNN, and transformer architectures.
+2. No attention mechanism, transformer block, feed-forward MLP subnetwork, CNN, RNN, KV cache, perceptron stack, or next-token softmax architecture is introduced.
+3. The existing cross-affine RSF coupling equations, exact inverse, triangular Jacobian, O(dim) log-determinant, reversible backward reconstruction, depth-independent activation-memory property, OFTB transform, and triple-signal training path remain mathematically intact.
+4. Performance optimizations may change the evaluation strategy, batching, data layout, kernel fusion, tiling, precision representation, synchronization, or memory ownership, but must not change the RSF mathematical mapping.
+5. Batched matrix multiplication or GEMM-shaped evaluation is permitted only as an algebraically equivalent implementation of the existing affine coupling operations. GEMM is an execution strategy, not an architectural replacement.
+6. No external machine-learning framework or dependency may be introduced. Do not add PyTorch, TensorFlow, JAX, cuDNN graph APIs, transformer libraries, external optimizer libraries, or external model runtimes.
+7. Preserve `.dependencies = .{}` for external ML dependencies. Use Zig standard library, existing local imports, the existing Futhark/CUDA integration, and existing local NCCL/CUDA bindings only.
+8. Training must not stall because of Fisher cold-start spikes, f16 update disappearance, incorrect gradient normalization, optimizer-state resets, silent host/device races, stale telemetry, or invalid checkpoint restoration.
+9. The first valid optimizer update must be numerically bounded and must not exceed two times the configured steady-state trust bound.
+10. A checkpoint save→load→continue round trip must restore weights, embeddings, optimizer momentum, Fisher state, optimizer step counters, scheduler state, tokenizer state, and relevant training state without silently resetting any live production state.
+11. Continuing training from a checkpoint must produce the same numerical trajectory as uninterrupted training within the explicitly documented deterministic tolerance. Where bitwise equality is achievable, require bitwise equality.
+12. Every GPU-to-host read must be synchronized according to the generated Futhark API’s actual semantics before the host buffer is consumed.
+13. Every Futhark context access must obey one consistent, deadlock-free synchronization policy.
+14. The production path must contain no fabricated Hessian, fake Tensor Memory, simulated FP4/FP8 storage, write-only prefetch queue, unused cache policy, unconsumed telemetry field, or declared-but-unimplemented stabilization mechanism.
+15. Every modified source file must compile.
+16. Every new or modified subsystem must have tests.
+17. The benchmark must report current-step telemetry correctly rather than returning a previous-step result under the current step number.
+18. The actual GPU training path—not an unused host-side implementation—must contain the documented optimizer, precision, spectral-stability, checkpoint, and gradient-control behavior.
+19. No code may be replaced with pseudocode, ellipses, TODO comments, mock implementations, dummy return values, simplified examples, omitted helper functions, or “existing code remains unchanged” statements.
+20. Deliver every modified file in complete, unabridged form.
+
+──────────────────────────────────────────────────────────────────────────────
+ARCHITECTURE INVARIANTS
+──────────────────────────────────────────────────────────────────────────────
+
+Treat the following properties as immutable design requirements.
+
+The RSF coupling primitive splits each row into two halves and applies a reversible cross-affine transformation. Its effective structure is:
+
+1. Split the input:
+   x = (x1, x2)
+
+2. Compute the scale preactivation from x2 using the existing affine coupling weights:
+   p = Ws · x2 + bs
+
+3. Clamp only for numerical exp-range control:
+   s = clamp(p, clip_min, clip_max)
+
+4. Apply multiplicative coupling:
+   y1 = x1 ⊙ exp(s)
+
+5. Compute translation from y1:
+   t = Wt · y1 + bt
+
+6. Apply additive coupling:
+   y2 = x2 + t
+
+7. Apply the existing OFTB reversible mixing transform.
+
+8. The inverse reconstructs x2 from y1/y2 and then reconstructs x1 by division through exp(s).
+
+Do not replace this with:
+
+- a perceptron layer;
+- an activation applied as σ(Wx+b) to produce a hidden representation;
+- an MLP;
+- an attention block;
+- a convolution;
+- a recurrent cell;
+- a transformer feed-forward block;
+- a noninvertible residual block.
+
+The existing affine maps inside the coupling primitive are part of the RSF definition. Rewriting multiple row-wise matrix-vector evaluations as a batched matrix multiplication does not alter the architecture and is permitted.
+
+Preserve:
+
+- exact algebraic inverse subject to finite-precision tolerance;
+- triangular Jacobian structure;
+- log-determinant from the scale path;
+- O(dim) determinant evaluation;
+- reversible backward reconstruction without storing a full activation stack;
+- depth-independent activation-cache memory;
+- OFTB reversible mixing;
+- NSIR, SSRG, MGT, SFD, SSI, CREV, CCK, ESSO, FNDS, R-GPU, FVE, and SPE boundaries where they are actually implemented;
+- the triple-signal training objective where each signal is mathematically valid and demonstrably connected to live parameters;
+- no additional full RSF stack traversal solely for reconstruction;
+- no architecture substitution.
+
+Do not assume the reconstruction signal is useful or useless. Trace it exactly through the live computation graph. Prove which parameters receive its gradient. Add tests demonstrating whether it is nonzero where intended. If the current implementation fails to propagate it to an intended parameter group, repair the gradient path without changing the RSF forward mapping.
+
+Do not modify any Lean 4 invertibility theorem or its assumptions unless a corresponding formal proof update is supplied. Prefer preserving the exact equations so no proof change is required.
+
+──────────────────────────────────────────────────────────────────────────────
+SOURCE SCOPE
+──────────────────────────────────────────────────────────────────────────────
+
+Audit and update every supplied source file and every directly required dependent file, including at minimum:
+
+- the Modal benchmark/launcher file;
+- RSF Zig implementation;
+- distributed trainer;
+- distributed executable main;
+- SFD optimizer implementation;
+- accelerator interface;
+- Futhark kernels;
+- Futhark generated bindings where signatures must change;
+- NCCL integration where datatype or state synchronization changes;
+- checkpoint read/write implementation;
+- embedding accelerator;
+- tokenizer loading/training integration;
+- graph batch encoding and bitmask integration;
+- build.zig and build options if required;
+- tests for all modified behavior.
+
+Before changing code, reconstruct the exact file boundaries from the supplied source. Do not treat concatenated files as one source file. Identify each file by imports, declarations, and references. If exact file paths are unavailable, assign stable logical names and state the mapping.
+
+Do not claim line-exact completeness if source files are truncated or dependencies required to verify a path are unavailable. In that situation, output a blocking item identifying the exact missing file or symbol. Never fabricate missing source.
+
+──────────────────────────────────────────────────────────────────────────────
+VERIFICATION RULES
+──────────────────────────────────────────────────────────────────────────────
+
+Perform the audit before implementing fixes.
+
+Read every supplied character from the first character to the last character.
+
+For every source file:
+
+1. Enumerate every declaration.
+2. Determine whether it is reachable from the production training executable.
+3. Build a call graph from the Modal entry point through:
+   - CPU preparation;
+   - build;
+   - dataset preparation;
+   - tokenizer training/loading;
+   - graph construction;
+   - trainer initialization;
+   - embedding forward;
+   - RSF forward;
+   - fused backward;
+   - SFD update;
+   - NCCL synchronization;
+   - embedding update;
+   - spectral normalization;
+   - telemetry;
+   - epoch completion;
+   - checkpoint capture;
+   - checkpoint serialization;
+   - checkpoint restoration;
+   - inference startup.
+4. Distinguish live production code from tests, legacy paths, optional paths, dead code, and experimental scaffolding.
+5. Theoretically execute normal, failure, timeout, allocation-failure, invalid-input, checkpoint-resume, single-GPU, and multi-GPU paths.
+6. Verify ownership of every allocation and Futhark opaque object.
+7. Verify every `errdefer`, `defer`, explicit free, object transfer, tuple projection, and replacement operation.
+8. Verify every host/device synchronization point.
+9. Verify every mutex boundary and possible concurrent access to a Futhark context.
+10. Verify every precision conversion and every live tensor’s actual physical storage type.
+11. Verify every optimizer equation against the implementation actually used by GPU training.
+12. Verify all checkpointed state against all live mutable state.
+13. Verify all dataset partition calculations.
+14. Verify all graph chunk-boundary behavior.
+15. Verify all output telemetry is associated with the correct training step.
+16. Verify compile-time and runtime Futhark entry names against generated bindings.
+17. Verify ownership semantics of `futhark_context_get_error` from the generated API before freeing or retaining the returned pointer.
+18. Do not label something an error solely because it is unconventional. Report only a demonstrable contradiction, invalid ownership pattern, unreachable promised functionality, incorrect equation, race, numerical defect, data-loss path, invalid API use, or production placeholder.
+19. For every issue, record:
+   - file;
+   - exact line or symbol;
+   - severity;
+   - live call path;
+   - direct code evidence;
+   - practical consequence;
+   - required fix;
+   - test that proves the fix.
+20. Do not repeat the same root cause as multiple independent errors unless separate call paths have distinct consequences.
+
+Only write `FILE CLOSED. ALL ERRORS LISTED.` if all supplied files were fully available, every required dependency used for verification was available, and the complete audit was actually performed. Otherwise write `AUDIT BLOCKED` followed by the exact missing material.
+
+──────────────────────────────────────────────────────────────────────────────
+PHASE 1 — ESTABLISH A REPRODUCIBLE BASELINE
+──────────────────────────────────────────────────────────────────────────────
+
+Before modifying implementation behavior:
+
+1. Build the current CPU and GPU targets in release mode.
+2. Build all tests.
+3. Record exact compiler versions:
+   - Zig;
+   - Futhark;
+   - CUDA toolkit;
+   - NVIDIA driver;
+   - NCCL.
+4. Record generated Futhark entry signatures.
+5. Run a minimal deterministic training configuration:
+   - one GPU;
+   - small dimension;
+   - two layers;
+   - small vocabulary;
+   - small batch;
+   - short sequence length;
+   - fixed seed;
+   - no relational pass;
+   - no checkpoint.
+6. Record:
+   - forward output;
+   - inverse reconstruction error;
+   - loss;
+   - reconstruction loss;
+   - log-determinant;
+   - gradient norms;
+   - update norms;
+   - source RMS;
+   - per-stage timings.
+7. Run the current B200 benchmark long enough to measure:
+   - dataset preparation time;
+   - tokenizer time;
+   - graph-construction time;
+   - first-step compilation time;
+   - first-step execution time;
+   - steady-state step time;
+   - relational-pass time;
+   - spectral-normalization time;
+   - checkpoint-capture time;
+   - checkpoint-write time;
+   - GPU utilization;
+   - HBM usage.
+8. Separate one-time startup/compilation time from epoch time.
+9. Add explicit timers around every major stage before making performance claims.
+10. Preserve baseline results for regression comparison.
+
+Do not use a single total wall-clock duration to diagnose training. Produce separate measured intervals.
+
+──────────────────────────────────────────────────────────────────────────────
+PHASE 2 — MEMORY SAFETY AND OWNERSHIP
+──────────────────────────────────────────────────────────────────────────────
+
+Repair all verified allocation, ownership, and failure-path defects.
+
+Required fixes include the following where confirmed by the exact source.
+
+1. `Tensor.load`
+   - Ensure the temporary `dims` allocation has exactly one owner.
+   - Prevent the explicit `allocator.free(dims)` and the active `errdefer allocator.free(dims)` from both running after a later failure.
+   - Use an ownership guard or restructure construction so no fallible operation occurs after explicit release while the `errdefer` remains armed.
+   - Add truncated-stream tests that fail after tensor construction and verify no double free with `std.testing.allocator`.
+
+2. `Tensor.matmul`
+   - If one of several worker thread spawns fails, join every successfully created worker before returning.
+   - Do not allow `b_transposed` or output buffers to be freed while a worker may still access them.
+   - Add an injectable spawn-failure test or a worker-management helper test.
+
+3. `readMatFlat`
+   - Add `errdefer` for the output flat allocation until ownership is returned.
+   - Ensure malformed row dimensions cannot leak the output allocation.
+   - Prefer the direct flat read API over allocating a slice for each row.
+
+4. Futhark opaque tuple handling
+   - Define ownership after every projection.
+   - Confirm whether projected arrays remain independently owned after freeing the tuple.
+   - Free each array exactly once.
+   - Ensure partial projection failure frees all successfully projected objects.
+   - Null every pointer after ownership transfer or release.
+
+5. Stack replacement
+   - Never leave optional array fields pointing at freed Futhark arrays.
+   - Replace state transactionally:
+     a. create/project every replacement;
+     b. verify all replacements;
+     c. free old arrays;
+     d. assign new arrays;
+     e. update validity flags.
+   - On failure, retain the complete old valid state.
+
+6. Error strings
+   - Inspect generated Futhark API ownership rules.
+   - Free error strings only if the generated API transfers ownership.
+   - Never guess ownership.
+   - Add one centralized error extraction/logging helper.
+
+7. Integer overflow
+   - Replace unchecked size products such as `rows * cols`, `vocab_size * dim`, `max_batch * max_seq`, and graph bitmask sizes with checked multiplication before allocation or pointer-count construction.
+   - Return a dedicated overflow/invalid-size error.
+
+8. Arena lifetimes
+   - Verify that parsed JSON string slices never escape the arena that owns them.
+   - Duplicate only data that must outlive the per-line arena.
+   - Add malformed and oversized dataset-line tests.
+
+9. Handle registries
+   - Verify copied-handle detection and destruction behavior.
+   - Add concurrent acquire/release/destroy tests.
+   - Ensure registry shrinking cannot invalidate active references.
+
+10. Scratch allocator
+    - Audit the global `GeneralPurposeAllocator` used by `scratchAllocator`.
+    - Determine whether concurrent calls are safe.
+    - Replace it with a thread-safe allocator, thread-local scratch allocator, or caller-owned arena if concurrent access is possible.
+    - Add concurrent forward/inverse tests.
+
+──────────────────────────────────────────────────────────────────────────────
+PHASE 3 — DEFINE ONE CANONICAL SFD ALGORITHM
+──────────────────────────────────────────────────────────────────────────────
+
+The GPU trainer must use one explicitly defined SFD update equation. Host reference code, Futhark kernels, tests, checkpoint state, and embedding updates must implement the same equation.
+
+Use this canonical state definition unless the repository contains a formally documented alternative that must be preserved:
+
+For step t beginning at 1:
+
+m_t = β · m_(t−1) + (1−β) · g_t
+
+f_t = γ · f_(t−1) + (1−γ) · g_t²
+
+m_hat = m_t / (1−β^t)
+
+f_hat = f_t / (1−γ^t)
+
+raw_update = lr_t · m_hat / (sqrt(max(f_hat, 0)) + ε)
+
+Apply one explicitly documented trust bound:
+
+bound = trust_ratio · max(abs(w), weight_floor)
+
+update = clamp(raw_update, −bound, bound)
+
+w_t = w_(t−1) − update
+
+Default stability values:
+
+- momentum beta: retain the configured value after validation;
+- Fisher gamma: retain the configured value after validation;
+- epsilon: at least 1e-12 and finite;
+- trust ratio: 0.1 unless benchmark validation proves another bounded value;
+- weight floor: 1e-3;
+- Fisher initial state: zero;
+- momentum initial state: zero;
+- optimizer step: zero before the first update.
+
+Implement the following:
+
+1. Remove the current semantic mismatch where one path uses:
+   - `(1−beta)·g`;
+   while another uses:
+   - `+g`.
+2. Remove double preconditioning where an update is divided by both an Adam-style second moment and a separate Fisher value representing the same gradient-square statistic.
+3. Use one Fisher/second-moment preconditioner.
+4. Add bias correction to:
+   - host SFD reference;
+   - fused RSF Futhark update;
+   - embedding Futhark update;
+   - multi-tensor host reference.
+5. Pass the live optimizer step into every fused update.
+6. Use identical non-finite-gradient behavior in vectorized and scalar tails:
+   - substitute a zero gradient;
+   - apply state decay consistently;
+   - do not update the parameter with a non-finite value.
+7. Validate:
+   - 0 ≤ beta < 1;
+   - 0 ≤ gamma < 1;
+   - epsilon > 0;
+   - learning rate ≥ 0;
+   - all are finite.
+8. Use dedicated hyperparameter errors instead of dimension errors.
+9. Remove or isolate the legacy f16 velocity optimizer so it cannot be confused with the live fused f32 momentum/Fisher optimizer.
+10. Do not save stale legacy velocity arrays as if they were the live optimizer state.
+11. Delete unused optimizer configuration fields if they are not implemented.
+12. If a field is retained, connect it to the production path and test it.
+13. Do not advertise dynamic loss scaling, warmup, gradient control, KFAC, Sophia, MARS, mixed precision, or spectral clipping as production functionality unless the production GPU path invokes it.
+
+Create a host reference implementation of the canonical SFD equation and compare the GPU kernel against it for:
+
+- step 1;
+- step 2;
+- step 10;
+- step 100;
+- step 1000;
+- zero gradients;
+- very small gradients;
+- large gradients;
+- NaN/Inf gradients;
+- positive and negative weights.
+
+──────────────────────────────────────────────────────────────────────────────
+PHASE 4 — REAL MIXED PRECISION WITH F32 MASTER WEIGHTS
+──────────────────────────────────────────────────────────────────────────────
+
+Implement real f32 master weights for the live GPU training path. Do not use f32 arrays containing quantized values and label them FP4/FP8/FP16.
+
+Use the following storage contract:
+
+RSF coupling stack:
+
+- f32 master weights S;
+- f32 master weights T;
+- f16 compute shadow S;
+- f16 compute shadow T;
+- f32 momentum S;
+- f32 momentum T;
+- f32 Fisher S;
+- f32 Fisher T.
+
+Embedding:
+
+- f32 master embedding;
+- f16 compute shadow embedding;
+- f32 gradient accumulation or f32 sparse/dense update accumulator;
+- f32 momentum;
+- f32 Fisher.
+
+The B200 memory capacity is sufficient for this benchmark configuration. Use f32 masters rather than falling back to stochastic rounding unless an actual checked memory calculation proves the configuration cannot fit. If a fallback is implemented, it must be explicit and tested, not silently selected.
+
+Implementation requirements:
+
+1. Add required Futhark f32 array wrappers.
+2. Initialize f32 master weights directly.
+3. Generate f16 shadows with a dedicated conversion kernel.
+4. Forward and inverse use the f16 shadow.
+5. SFD updates the f32 master.
+6. Regenerate the f16 shadow only after a successful master update.
+7. NCCL synchronizes the f32 master and f32 optimizer state where distributed synchronization is required.
+8. Do not average f16 weights when an f32 master exists.
+9. Keep all reductions and optimizer arithmetic in f32.
+10. Keep loss, reconstruction loss, log-determinant, norms, and update telemetry in f32.
+11. Do not convert scalar metrics to f16.
+12. Update checkpoint format to store f32 masters.
+13. Add numerical tests proving that sub-f16-ULP updates accumulate in the f32 master and eventually change the f16 shadow.
+14. Record memory consumption for:
+    - master weights;
+    - shadows;
+    - momentum;
+    - Fisher;
+    - embeddings;
+    - temporary fused-kernel arrays.
+15. Ensure temporary peak memory fits B200 capacity with a documented margin.
+
+──────────────────────────────────────────────────────────────────────────────
+PHASE 5 — OPTIMIZER-STATE LIFETIME AND STACK PACKING
+──────────────────────────────────────────────────────────────────────────────
+
+Replace the current stack lifecycle with explicit independent validity domains.
+
+Maintain separate flags:
+
+- master weights valid;
+- f16 shadow valid;
+- legacy layer mirror valid;
+- optimizer state initialized;
+- optimizer state valid.
+
+Split stack operations into:
+
+1. `packMasterWeightsFromLayers`
+   - Called only when importing legacy/per-layer weight storage.
+   - Does not allocate or reset optimizer state.
+   - Creates f32 masters and f16 shadows transactionally.
+
+2. `ensureOptimizerState`
+   - Allocates momentum and Fisher only when absent.
+   - Never zeros existing state.
+   - Initializes state only for a new model or explicit reset.
+
+3. `refreshComputeShadows`
+   - Converts f32 masters to f16 compute arrays.
+   - Does not modify momentum, Fisher, or step.
+
+4. `syncLayerMirrorsFromMaster`
+   - Used only by legacy APIs or checkpoint compatibility.
+   - Does not reset optimizer state.
+
+5. `resetOptimizerState`
+   - Explicit operation.
+   - Allowed only for fresh training, deliberate optimizer reset, or documented legacy-checkpoint migration.
+
+6. `replaceTrainingState`
+   - Transactionally installs updated masters, shadows, momentum, and Fisher from a fused update.
+
+Remove any behavior where marking weights dirty automatically zeros momentum or Fisher.
+
+Rename misleading functions. A function named “keep momentum” must not free momentum.
+
+Audit all callers:
+
+- `setLayerWeightsS`;
+- `setLayerWeightsT`;
+- `scaleWeights`;
+- `scaleLayerMatrix`;
+- checkpoint load;
+- spectral normalization;
+- NCCL synchronization;
+- fused update;
+- inference mirror synchronization.
+
+Add tests:
+
+1. Initialize nonzero momentum and Fisher.
+2. Replace one layer’s weights.
+3. Repack or refresh shadows.
+4. Assert momentum and Fisher are unchanged.
+5. Save and load.
+6. Assert state and step remain unchanged.
+
+──────────────────────────────────────────────────────────────────────────────
+PHASE 6 — COMPLETE CHECKPOINT FORMAT
+──────────────────────────────────────────────────────────────────────────────
+
+Bump the checkpoint version and define a complete, documented binary schema.
+
+The checkpoint must contain:
+
+1. magic;
+2. version;
+3. endianness/versioned encoding;
+4. global training step;
+5. optimizer step;
+6. model dimension;
+7. layer count;
+8. vocabulary size;
+9. batch configuration needed for safe resume;
+10. learning-rate state;
+11. scheduler state if a scheduler is live;
+12. clip range;
+13. SFD beta;
+14. SFD gamma;
+15. SFD epsilon;
+16. trust ratio;
+17. weight floor;
+18. f32 master weights S;
+19. f32 master weights T;
+20. f32 momentum S;
+21. f32 momentum T;
+22. f32 Fisher S;
+23. f32 Fisher T;
+24. f32 master embedding;
+25. f32 embedding momentum;
+26. f32 embedding Fisher;
+27. frozen target embedding if enabled;
+28. tokenizer data;
+29. graph state that is intentionally persistent;
+30. knowledge graph nonce;
+31. CRC or stronger integrity field;
+32. trailer;
+33. no trailing undocumented bytes.
+
+Requirements:
+
+- Do not serialize live f32 state as f16.
+- Do not serialize stale legacy velocity arrays in place of live state.
+- Use chunked bulk binary writes.
+- Avoid one `writeInt` call per parameter.
+- Define explicit little-endian conversion for bulk f32 arrays on non-little-endian hosts.
+- Do not require a second complete copy of every multi-gigabyte array in host memory if streaming chunks can be used.
+- Checkpoint capture must synchronize the training stream once, then transfer state in bounded chunks.
+- Record checkpoint capture time separately from disk write time.
+- Preserve asynchronous disk writing only after the GPU snapshot is complete and ownership has transferred to immutable host buffers.
+- Do not allow the next training update to mutate a buffer still being serialized.
+- Restore all state transactionally. If any checksum, shape, size, or allocation validation fails, retain the old trainer state.
+- Validate all lengths before allocation.
+- Reject malformed, oversized, truncated, or trailing checkpoint data.
+
+Legacy migration:
+
+- Support the immediately previous checkpoint version if practical.
+- For a legacy checkpoint lacking optimizer state:
+  - load weights;
+  - initialize optimizer state to zero;
+  - set optimizer step to zero;
+  - emit an explicit migration warning;
+  - never pretend the optimizer trajectory is preserved.
+- Do not silently accept incompatible dimensions or vocabulary.
+
+Tests:
+
+- complete round trip;
+- corrupted CRC;
+- truncated data at every major section;
+- oversized length;
+- wrong dimension;
+- wrong layer count;
+- wrong vocabulary;
+- trailing data;
+- legacy migration;
+- deterministic continue-training comparison.
+
+──────────────────────────────────────────────────────────────────────────────
+PHASE 7 — FUTHARK CONTEXT SYNCHRONIZATION AND THREADING
+──────────────────────────────────────────────────────────────────────────────
+
+Establish one context synchronization design and apply it everywhere.
+
+Use a non-recursive ownership rule:
+
+- A public accelerator operation acquires the context mutex exactly once.
+- Internal helpers called while locked are explicitly named `...Locked` or `...Unlocked` according to the convention selected.
+- Internal helpers must not reacquire the same non-recursive mutex.
+- No Futhark C call may execute concurrently on the same context unless generated Futhark documentation explicitly guarantees that operation is thread-safe.
+- Object free, projection, values transfer, context sync, and error access follow the same rule.
+
+Audit every call matching:
+
+- `futhark_entry_*`;
+- `futhark_new_*`;
+- `futhark_free_*`;
+- `futhark_project_*`;
+- `futhark_values_*`;
+- `futhark_values_raw_*`;
+- `futhark_context_sync`;
+- `futhark_context_get_error`;
+- `futhark_context_clear_caches`.
+
+For every `futhark_values_*` call:
+
+1. Check the generated API semantics.
+2. If completion is asynchronous, synchronize before reading the destination.
+3. Keep the destination alive through completion.
+4. Do not issue redundant per-array syncs when several reads can be completed by one synchronization.
+5. For checkpoint and graph batches, issue transfers and use one synchronization per coherent batch where supported.
+
+Fix at minimum where confirmed:
+
+- `FutharkArray2DF16.values`;
+- `EmbeddingAccelerator.cloneDevice`;
+- flat array readers;
+- checkpoint snapshots;
+- graph encoding readers;
+- source RMS reads;
+- spectral state reads.
+
+CommBridge:
+
+1. Define exclusive ownership of each `FusedStepResult`.
+2. A queued job owns the result until finalization and deinitialization.
+3. Never access the pending tuple from both threads.
+4. Stop/shutdown must drain or explicitly cancel every job.
+5. Do not decrement `jobs_in_flight` for a shutdown command that was never counted.
+6. Replace `orderedRemove(0)` with a queue structure that does not perform O(n) shifts, even if current depth is small.
+7. Propagate the first worker error once and preserve later diagnostic errors.
+8. Ensure trainer destruction stops the worker before accelerator destruction.
+9. Add concurrent stress tests.
+
+──────────────────────────────────────────────────────────────────────────────
+PHASE 8 — CORRECT STEP TELEMETRY AND PIPELINING
+──────────────────────────────────────────────────────────────────────────────
+
+Repair the one-step telemetry lag.
+
+The current step API must not enqueue step N and then return telemetry from step N−1 as if it belonged to step N.
+
+Choose and implement one correct design:
+
+Preferred pipelined design:
+
+1. Separate “submitted step” from “completed step”.
+2. At the beginning of an iteration, collect the completed result of the previous submitted step.
+3. Associate telemetry with its stored step identifier.
+4. Add completed telemetry to epoch totals using the completed step’s token weight.
+5. Submit the current GPU step.
+6. At epoch end, flush and collect the final pending step.
+7. Log only completed telemetry.
+8. Never log a default zero loss for step 1.
+9. Preserve overlap where real overlap exists.
+
+If the current single-context dependency prevents safe overlap:
+
+- process the communication/update synchronously;
+- return current-step telemetry correctly;
+- optimize later only after correctness tests pass.
+
+Update `StepResult` or introduce separate structures:
+
+- `SubmittedStep`;
+- `CompletedStep`;
+- token/sample weight;
+- exact step identifier;
+- loss;
+- reconstruction loss;
+- log-determinant;
+- source RMS;
+- timing fields.
+
+Tests:
+
+- first step is not default zero;
+- returned step ID matches submitted data;
+- N steps produce exactly N metrics;
+- epoch aggregate includes the last step;
+- worker failure is attached to the correct step.
+
+──────────────────────────────────────────────────────────────────────────────
+PHASE 9 — GRADIENT NORMALIZATION AND TRIPLE-SIGNAL CORRECTNESS
+──────────────────────────────────────────────────────────────────────────────
+
+Make the derivatives consistent with the reported scalar objectives.
+
+For masked mean squared error:
+
+loss = sum_active((output−target)²) / (valid_tokens · model_dim)
+
+Therefore:
+
+d_loss/d_output = 2 · (output−target) / (valid_tokens · model_dim)
+
+Implement this normalization exactly once.
+
+Do not:
+
+- seed with `2·diff`;
+- then divide weight gradients only by token count;
+- and thereby omit division by model dimension.
+
+Choose one consistent formulation:
+
+A. Normalize the gradient seed by the complete element count and sum parameter gradients.
+
+or
+
+B. Normalize by model dimension in the seed and average parameter gradients by valid tokens.
+
+Document the choice and verify host/kernel parity.
+
+Reconstruction signal:
+
+1. Trace the reconstructed input and reconstruction objective.
+2. Determine whether reconstruction loss is intended to update:
+   - embeddings;
+   - coupling weights;
+   - both;
+   - another state.
+3. Verify the actual gradient path.
+4. Preserve no-extra-stack-traversal behavior.
+5. Do not recompute the entire stack solely for reconstruction.
+6. If exact invertibility causes cancellation for a parameter group, document the proven result rather than fabricating a signal.
+7. If finite-precision reconstruction is intentionally used as a stability signal, bound and test it.
+8. Ensure reconstruction scaling is independent of padding.
+9. Ensure `reconstruction_alpha` phases change the intended gradient rather than only a reported metric.
+
+Log-determinant signal:
+
+1. Preserve O(dim) triangular-Jacobian computation.
+2. Validate sign and scale.
+3. Ensure `logdet_weight` reaches the intended scale-path derivative.
+4. Test zero weight equivalence against ordinary backward.
+5. Test nonzero weight changes only the mathematically expected adjoint terms.
+
+Embedding gradient:
+
+1. Accumulate embedding gradients in f32.
+2. Do not use f16 histogram accumulation for repeated tokens.
+3. Exclude padding and invalid tokens.
+4. Use a verified global norm or token-normalized scale.
+5. If distributed, apply local token weighting exactly once.
+6. Perform NCCL reduction in f32.
+7. Zero the gradient state only after a successful update.
+8. On update failure, retain gradients and state for diagnostic handling or abort safely.
+
+Learning rate:
+
+- Remove the benchmark default `0.005` unless validated under the repaired normalization.
+- Start validation at `3e-4`.
+- Add warmup if enabled.
+- Record actual update-to-weight ratios.
+- Select the final default from measured stable runs, not guesswork.
+
+──────────────────────────────────────────────────────────────────────────────
+PHASE 10 — SPECTRAL NORMALIZATION
+──────────────────────────────────────────────────────────────────────────────
+
+Make spectral stabilization consistent with the documented production behavior.
+
+Current CPU-side spectral constraints do not automatically constrain the live GPU coupling stack.
+
+Implement:
+
+1. Per-layer GPU spectral-state arrays for S and T, or another bounded-memory equivalent.
+2. Power iteration on f32 master coupling weights.
+3. Configurable target norm.
+4. Configurable power-iteration count.
+5. A configurable application interval.
+6. Depth-compensation behavior with a mathematically documented formula.
+7. State persistence if power-iteration vectors are required for deterministic resume.
+8. No full GPU→CPU weight transfer for routine normalization.
+9. No reset of SFD momentum/Fisher when weights are spectrally rescaled.
+10. If weights are rescaled, define whether momentum/Fisher should be rescaled consistently; implement and test the chosen invariant.
+
+Embedding spectral normalization:
+
+- operate on the f32 master embedding;
+- regenerate the f16 shadow afterward;
+- do not repeatedly shrink the whole matrix due to an incorrect target hardcoded to 1.0 when config requests 0.9;
+- use the configured target singular value;
+- separate estimation from normalization;
+- report sigma before and after;
+- verify source RMS does not collapse solely because of normalization.
+
+Remove duplicate CPU/GPU spectral implementations or make one a tested reference.
+
+──────────────────────────────────────────────────────────────────────────────
+PHASE 11 — RSF FUTHARK KERNEL PERFORMANCE
+──────────────────────────────────────────────────────────────────────────────
+
+Optimize the existing RSF equations without changing the architecture.
+
+The current per-row/per-token scalar reductions and materialized per-token outer products must be replaced with token-major, matrix-shaped computations.
+
+For each layer, flatten active batch/sequence rows into M active tokens.
+
+Forward:
+
+1. Split:
+   X1: [M][half]
+   X2: [M][half]
+
+2. Separate weights:
+   Ws_body: [half][half]
+   bs: [half]
+   Wt_body: [half][half]
+   bt: [half]
+
+3. Compute:
+   P = X2 · transpose(Ws_body) + bs
+
+4. Clamp:
+   S = clamp(P, clip_min, clip_max)
+
+5. Scale:
+   Y1 = X1 ⊙ exp(S)
+
+6. Translation:
+   T = Y1 · transpose(Wt_body) + bt
+
+7. Coupling:
+   Y2 = X2 + T
+
+8. OFTB:
+   apply the existing reversible mixing.
+
+Backward for each layer in reverse order:
+
+1. Undo OFTB on outputs and adjoints.
+2. Reconstruct X2 and X1 algebraically.
+3. Compute:
+   dY1_total = dY1 + dY2 · Wt_body
+
+4. Compute scale adjoint with clipping mask and log-determinant term.
+5. Compute:
+   dX1 = dY1_total ⊙ exp(S)
+
+6. Compute:
+   dX2 = dY2 + dS · Ws_body
+
+7. Parameter gradients:
+   dWs_body = transpose(dS) · X2
+   dbs = reduce_rows(dS)
+   dWt_body = transpose(dY2) · Y1
+   dbt = reduce_rows(dY2)
+
+8. Use f32 accumulation for every reduction.
+9. Apply the canonical SFD update to f32 masters.
+10. Convert updated masters to f16 shadows.
+
+Do not materialize `[token][half][half+1]` parameter-gradient matrices.
+
+Do not construct one full outer-product matrix per token and then reduce it.
+
+Padding compaction:
+
+1. Build active-token indices from sequence lengths.
+2. Gather active input and target rows.
+3. Run the RSF stack only over active rows.
+4. Scatter input deltas back into the padded 3D layout.
+5. Ensure padding rows remain exactly zero where required.
+6. Avoid processing the full `batch × max_seq_len` when actual lengths are shorter.
+7. The compaction operation must remain on GPU after lengths are uploaded.
+
+Futhark implementation:
+
+- use shape-specialized, tiled, fusion-friendly array operations;
+- avoid repeated full transposes inside inner loops when transposed views or prepacked layouts can be maintained;
+- evaluate whether storing weight bodies in the orientation consumed by forward/backward removes transposes;
+- preserve exact bias handling;
+- do not introduce cuBLAS or an external ML dependency;
+- inspect generated CUDA to verify the resulting kernels are not scalar per-row reductions;
+- record achieved throughput and HBM bandwidth;
+- distinguish Futhark compile limitations from architecture limitations.
+
+Kernel tests:
+
+- forward equivalence against current reference;
+- inverse equivalence;
+- backward input-gradient equivalence;
+- S/T parameter-gradient equivalence;
+- log-determinant equivalence;
+- reconstruction equivalence;
+- padding equivalence;
+- one-layer and multilayer tests;
+- tolerances appropriate to f16 shadows with f32 accumulation.
+
+──────────────────────────────────────────────────────────────────────────────
+PHASE 12 — DATASET, TOKENIZER, AND GRAPH PATH
+──────────────────────────────────────────────────────────────────────────────
+
+Dataset:
+
+1. Use one canonical dataset loader.
+2. Remove duplicate incompatible partitioning semantics between trainer and executable.
+3. Ensure “valid sample” means the same thing in counting and loading.
+4. If tokenizability is part of validity, apply it consistently in both passes.
+5. Ensure `JAIDE_TOTAL_SAMPLES` is validated against the actual file when requested in strict mode.
+6. Avoid rescanning from the beginning for every rank range where an index can be built once.
+7. Record dataset loading separately from epoch time.
+8. Add tests for:
+   - empty records;
+   - malformed JSON;
+   - missing text;
+   - un-tokenizable text;
+   - uneven world-size partition;
+   - more ranks than samples;
+   - maximum sample cap;
+   - deterministic partitioning.
+
+Tokenizer:
+
+1. Preserve MGT.
+2. Do not replace it with BPE from an external library.
+3. Ensure rank 0 vocabulary training and cross-rank visibility are synchronized.
+4. Validate vocabulary file integrity before setting `JAIDE_VOCAB_READY`.
+5. Make tokenizer load errors deterministic across ranks.
+6. Ensure encode is thread-safe before using it in `BatchPreparationTask`; otherwise use a separate tokenizer instance or serialize encode operations.
+7. Persist all tokenizer state required for exact resume.
+
+Graph chunk boundaries:
+
+The graph kernel produces predecessor relations up to distance three. Chunked graph encoding must preserve relations crossing chunk boundaries.
+
+Implement one of:
+
+A. Three-element overlap:
+   - for every chunk after the first, include the previous three nodes;
+   - discard duplicate node outputs;
+   - retain cross-boundary edges and bitmask bits.
+
+or:
+
+B. Postprocess boundary edges:
+   - generate missing predecessor relations explicitly from global indices.
+
+Verify:
+
+- edge from chunk_start to chunk_start−1;
+- edge to chunk_start−2;
+- edge to chunk_start−3;
+- no duplicate edges;
+- correct global index offset.
+
+Graph bitmask memory:
+
+1. Calculate the full bitmask memory before allocation.
+2. Do not allocate an O(n²/64) global bitmask for 500,000 nodes unless the live algorithm actually requires and can efficiently consume it.
+3. Use sparse/chunked bitmask shards if graph locality is bounded.
+4. Do not copy a multi-gigabyte global bitmask unnecessarily between host and device.
+5. Preserve sparse self-similar relations.
+6. Measure graph construction and propagation separately from training.
+
+Relational pass:
+
+1. Measure its actual cost.
+2. Do not run CPU-heavy graph mutation synchronously every ten steps without profiling.
+3. Preserve relational behavior, but move non-weight-dependent bookkeeping off the GPU critical path where safe.
+4. Define state ownership if moved to a worker.
+5. Ensure the pass uses completed step data.
+6. Preserve deterministic ordering where checkpoint/resume requires it.
+7. Restore the default interval only after measurement; do not blindly assume 10 or 50 is correct.
+8. Include relational-pass time in step telemetry.
+
+──────────────────────────────────────────────────────────────────────────────
+PHASE 13 — REMOVE OR QUARANTINE NON-PRODUCTION IMPLEMENTATIONS
+──────────────────────────────────────────────────────────────────────────────
+
+Audit the following components and either implement them completely in the live production path or remove them from production compilation behind an explicit experimental build option.
+
+1. Simulated precision
+   - `Tensor` stores `[]f32` regardless of declared FP4/FP8/FP16 dtype.
+   - Quantizing values in an f32 buffer is not physical low-precision storage.
+   - Do not label it memory compression.
+   - Either implement packed physical storage and live kernels or quarantine/delete it.
+
+2. `B200MemoryManager`
+   - A host byte array is not B200 Tensor Memory.
+   - A one-way copy with an `in_tensor_memory` flag is not device placement.
+   - An unconsumed prefetch queue is not prefetching.
+   - Remove these claims and code from production unless implemented with real CUDA/device facilities.
+
+3. `ReversibleOptimizerState`
+   - Fabricated residual functions and gradient scaling unrelated to RSF are prohibited.
+   - A cache that is never populated must not be presented as functional.
+   - Replace it with real RSF inverse/backward integration or remove it.
+
+4. `SophiaSOAPOptimizer`
+   - `gradient × Rademacher vector` is not a Hessian-vector product.
+   - Do not present it as Hutchinson Hessian estimation.
+   - Implement a real HVP against the live objective or remove the path.
+   - Do not apply two separate parameter updates from the same gradient in one call unless the combined algorithm is formally defined and tested.
+
+5. `KFACBlock`
+   - A matrix inverse is not an inverse square root.
+   - Rename operations accurately or implement a real inverse square root.
+   - Do not apply arbitrary modulo-index diagonal scaling as a generic fallback.
+   - If KFAC is not connected to RSF production training, quarantine it.
+
+6. Mixed precision trainer
+   - Loss scaling must be applied before backward.
+   - Overflow must be checked on scaled gradients.
+   - On overflow, skip the complete optimizer update.
+   - Back off the scale.
+   - On success, unscale once and update f32 masters.
+   - If this is not integrated, remove it from production.
+
+7. Scheduler, Gaussian process, Bayesian optimizer, MARS
+   - Wire each retained component into a documented production path and test it.
+   - Otherwise quarantine it.
+   - Do not retain unused configuration fields that imply functionality.
+
+8. Telemetry
+   - Do not report tensor-core or NVLink utilization as zero when unavailable.
+   - Preserve optional/null semantics.
+   - Remove average fields that convert “not measured” into fabricated zero.
+   - If real counters are implemented, use a supported management API and document availability.
+   - Do not invoke `nvidia-smi` as a subprocess every training step.
+   - Rate-limit telemetry outside the critical path.
+
+9. Validation metrics
+   - Remove validation-loss storage if no validation pass exists.
+   - Alternatively implement an actual validation pass.
+
+10. B200 configuration constants
+    - Remove decorative bandwidth/cache/TMEM values that do not affect implementation.
+    - Keep only measured or actively used fields.
+
+No production source file may contain a claim that is not backed by a live implementation.
+
+──────────────────────────────────────────────────────────────────────────────
+PHASE 14 — LEARNING-RATE SCHEDULER AND TRAINING CONTROL
+──────────────────────────────────────────────────────────────────────────────
+
+If a scheduler is retained, connect it to the actual fused GPU learning rate.
+
+Warmup must not produce a zero first update unless explicitly configured.
+
+Use:
+
+warmup_lr(step) = base_lr · (step+1) / warmup_steps
+
+for zero-based scheduler step values during warmup.
+
+Then use cosine decay or the selected documented schedule.
+
+Persist:
+
+- scheduler type;
+- current step;
+- base LR;
+- min LR;
+- max LR;
+- warmup steps;
+- total steps.
+
+Do not calculate an LR in an unused host object while the trainer continues to pass a fixed environment value.
+
+Training control must report:
+
+- scheduled LR;
+- VPU scaling;
+- final effective LR;
+- SFD trust-bound hit rate;
+- gradient norm;
+- update norm;
+- weight norm;
+- maximum scale preactivation;
+- fraction of scale elements clipped at min/max.
+
+Add a safety abort or controlled LR reduction when:
+
+- non-finite loss appears;
+- non-finite update appears;
+- clipping fraction exceeds a configured threshold for multiple steps;
+- source RMS collapses below a configured ratio;
+- update-to-weight ratio exceeds the trust bound because of an implementation error.
+
+Do not silently replace NaNs with zero and continue indefinitely without reporting the event.
+
+──────────────────────────────────────────────────────────────────────────────
+PHASE 15 — CHECKPOINT AND METRICS PERFORMANCE
+──────────────────────────────────────────────────────────────────────────────
+
+Checkpoint serialization must not dominate epoch time.
+
+Implement:
+
+1. Chunked bulk transfer from GPU.
+2. Chunked binary writes.
+3. No per-element writer calls for multi-gigabyte arrays.
+4. No conversion from f16 to f32 solely for serialization when the live master is already f32.
+5. One finiteness reduction on GPU per tensor group rather than a host loop over every element where practical.
+6. Immutable snapshot ownership.
+7. Atomic temporary file + sync + rename.
+8. Directory sync.
+9. Explicit capture and write timings.
+10. Configurable checkpoint interval.
+11. Option to save:
+    - full resumable checkpoint;
+    - inference-only checkpoint.
+12. Do not save a full checkpoint every epoch by default if the epoch is shorter than checkpoint capture time; select an explicit policy.
+
+Metrics:
+
+- batch writes rather than rewriting the entire metrics file after every epoch where unnecessary;
+- include version and configuration;
+- include measured token throughput;
+- include active-token ratio;
+- include startup and graph time separately;
+- include checkpoint timing separately.
+
+──────────────────────────────────────────────────────────────────────────────
+PHASE 16 — MODAL AND DISTRIBUTED EXECUTION
+──────────────────────────────────────────────────────────────────────────────
+
+Modal launcher:
+
+1. Validate consistency between requested GPU count and `GPU_SPEC`.
+2. Derive `NUM_GPUS` from the actual allocation or fail if they disagree.
+3. For one GPU, do not initialize unnecessary multi-rank synchronization.
+4. For multiple GPUs, use valid NCCL interfaces and device selection.
+5. Do not hardcode loopback/socket settings that prevent real multi-container communication when multiple nodes are requested.
+6. Preserve local one-container multirank behavior where intended.
+7. Record Futhark compilation/cache warmup separately.
+8. Validate the cache file against architecture, Futhark version, CUDA version, and generated program.
+9. Avoid clearing build cache unnecessarily when reproducible caching is safe.
+10. Validate fresh checkpoint timestamps without relying solely on filesystem granularity.
+
+Distributed reductions:
+
+- use f32 master weights and f32 optimizer state;
+- define whether weights or gradients are reduced;
+- do not update locally and then average optimizer states unless that is the explicitly chosen algorithm;
+- prefer allreduce of gradients followed by identical local SFD update when exact optimizer equivalence is required;
+- account for unequal token counts using exact local weighting;
+- do not represent arbitrary u64 values through f32 beyond exact integer range;
+- retain the limb-based implementation only if fully tested;
+- use dedicated integer collectives if existing NCCL bindings can support them.
+
+Stage marker synchronization:
+
+1. Use unique run-specific directories or names.
+2. Avoid stale marker collisions.
+3. Ensure root cleanup cannot race with non-root reads.
+4. Include error details, not only `fail`.
+5. Use bounded deadlines.
+6. Test rank failure and timeout.
+
+
+──────────────────────────────────────────────────────────────────────────────
+PHASE 18 — ACCEPTANCE CRITERIA
+──────────────────────────────────────────────────────────────────────────────
+
+The upgrade is accepted only if:
+
+1. All supplied files have been audited.
+2. Every reported error contains direct source evidence.
+3. Every confirmed live error has a code fix or an explicit justified removal.
+4. No unverified claim is presented as fact.
+5. No placeholder implementation remains in the production path.
+6. No external ML framework is added.
+7. RSF equations and invertibility remain unchanged.
+8. Forward/inverse tests pass.
+9. Gradient tests pass.
+10. Host/kernel SFD parity passes.
+11. Optimizer state survives repack and checkpoint.
+12. First-step Fisher behavior is bounded.
+13. Tiny updates accumulate in f32 masters.
+14. Current-step metrics are correct.
+15. Padding is not processed by the full RSF stack after compaction.
+16. The fused kernel no longer materializes per-token full parameter-gradient matrices.
+17. Checkpoint serialization uses bulk/chunked I/O.
+18. Graph chunk boundaries are correct.
+19. All builds and tests pass.
+20. Benchmark output separates startup, graph, training, relational, spectral, and checkpoint timing.
+21. The measured steady-state B200 training time is materially reduced.
+22. Any remaining gap from the target is explained using measured kernel, memory, synchronization, or occupancy data—not architectural guesses.
+23. The final implementation contains complete production code, not patches with omitted context.
+
