@@ -35,10 +35,11 @@ const FormalVerificationEngine = core_relational.FormalVerificationEngine;
 const SecurityProofEngine = core_relational.SecurityProofEngine;
 const QuantumTaskAdapter = core_relational.QuantumTaskAdapter;
 const QuantumSubgraph = core_relational.QuantumSubgraph;
+const checkpoint_schema = @import("../distributed/checkpoint_envelope.zig");
 
 const RESERVED_TOKEN_COUNT: usize = 4;
-const DISTRIBUTED_CHECKPOINT_MAGIC = "JAIDECKP";
-const DISTRIBUTED_CHECKPOINT_VERSION: u32 = 5;
+const DISTRIBUTED_CHECKPOINT_MAGIC = checkpoint_schema.MAGIC;
+const DISTRIBUTED_CHECKPOINT_VERSION = checkpoint_schema.VERSION;
 const MAX_DISTRIBUTED_CHECKPOINT_FILE_SIZE: u64 = 1 << 40;
 const MAX_DISTRIBUTED_MODEL_DIM: u64 = 1 << 20;
 const MAX_DISTRIBUTED_LAYER_COUNT: u64 = 1 << 20;
@@ -60,13 +61,13 @@ fn CheckpointReader(comptime ReaderType: type) type {
 
         const Self = @This();
 
-        fn readByte(self: *Self) !u8 {
+        pub fn readByte(self: *Self) !u8 {
             const byte = try self.inner.readByte();
             self.crc.update(&.{byte});
             return byte;
         }
 
-        fn readInt(self: *Self, comptime T: type, endian: std.builtin.Endian) !T {
+        pub fn readInt(self: *Self, comptime T: type, endian: std.builtin.Endian) !T {
             var bytes: [@sizeOf(T)]u8 = undefined;
             try self.inner.readNoEof(&bytes);
             self.crc.update(&bytes);
@@ -97,6 +98,12 @@ fn checkpointReadF32(reader: anytype) !f32 {
     return value;
 }
 
+fn checkpointForwardShadow(value: f32) f32 {
+    const clamped = std.math.clamp(value, @as(f32, -65504.0), @as(f32, 65504.0));
+    const shadow: f16 = @floatCast(clamped);
+    return @floatCast(shadow);
+}
+
 fn checkpointReadF64(reader: anytype) !f64 {
     const bits = try reader.readInt(u64, .little);
     const value: f64 = @bitCast(bits);
@@ -104,13 +111,39 @@ fn checkpointReadF64(reader: anytype) !f64 {
     return value;
 }
 
-fn checkpointReadArray(reader: anytype, destination: []f32) !void {
-    for (destination) |*value| value.* = try checkpointReadF32(reader);
+fn checkpointReadExpectedF32Array(reader: anytype, destination: []f32, nonnegative: bool) !void {
+    const length = try reader.readInt(u64, .little);
+    if (length != destination.len) return error.InvalidCheckpointWeights;
+    var bytes: [16 * 1024]u8 = undefined;
+    var offset: usize = 0;
+    while (offset < destination.len) {
+        const count = @min(bytes.len / @sizeOf(f32), destination.len - offset);
+        try reader.readNoEof(bytes[0 .. count * @sizeOf(f32)]);
+        var index: usize = 0;
+        while (index < count) : (index += 1) {
+            const value: f32 = @bitCast(mem.readInt(u32, bytes[index * 4 ..][0..4], .little));
+            if (!std.math.isFinite(value) or (nonnegative and value < 0.0)) return error.InvalidCheckpointValue;
+            destination[offset + index] = value;
+        }
+        offset += count;
+    }
 }
 
-fn checkpointSkipF32Array(reader: anytype, length: usize) !void {
-    var index: usize = 0;
-    while (index < length) : (index += 1) _ = try checkpointReadF32(reader);
+fn checkpointValidateExpectedF32Array(reader: anytype, expected_length: usize, nonnegative: bool) !void {
+    const length = try reader.readInt(u64, .little);
+    if (length != expected_length) return error.InvalidCheckpointWeights;
+    var bytes: [16 * 1024]u8 = undefined;
+    var offset: usize = 0;
+    while (offset < expected_length) {
+        const count = @min(bytes.len / @sizeOf(f32), expected_length - offset);
+        try reader.readNoEof(bytes[0 .. count * @sizeOf(f32)]);
+        var index: usize = 0;
+        while (index < count) : (index += 1) {
+            const value: f32 = @bitCast(mem.readInt(u32, bytes[index * 4 ..][0..4], .little));
+            if (!std.math.isFinite(value) or (nonnegative and value < 0.0)) return error.InvalidCheckpointValue;
+        }
+        offset += count;
+    }
 }
 
 fn checkpointReadBoundedLength(reader: anytype, maximum: u32) !usize {
@@ -178,7 +211,7 @@ fn loadDistributedCheckpoint(allocator: Allocator, path: []const u8) !ModelForma
     defer file.close();
 
     const stat = try file.stat();
-    if (stat.size < 8 + 4 + 8 + 8 + 8 + 8 + 8 + 4 + 4 + 1 + 1 + 32 + 4 + 4) return error.InvalidCheckpointStructure;
+    if (stat.size < 8 + @sizeOf(u32) * 4) return error.InvalidCheckpointStructure;
     if (stat.size > MAX_DISTRIBUTED_CHECKPOINT_FILE_SIZE) return error.CheckpointTooLarge;
 
     var buffered_reader = std.io.bufferedReader(file.reader());
@@ -187,81 +220,79 @@ fn loadDistributedCheckpoint(allocator: Allocator, path: []const u8) !ModelForma
 
     var magic: [8]u8 = undefined;
     try reader.readNoEof(&magic);
-    if (!mem.eql(u8, magic[0..], DISTRIBUTED_CHECKPOINT_MAGIC)) return error.InvalidCheckpointMagic;
+    if (!mem.eql(u8, magic[0..], DISTRIBUTED_CHECKPOINT_MAGIC[0..])) return error.InvalidCheckpointMagic;
+    if (try reader.readInt(u32, .little) != DISTRIBUTED_CHECKPOINT_VERSION) return error.UnsupportedCheckpointVersion;
+    if (try reader.readInt(u32, .little) != checkpoint_schema.ENDIAN_MARKER) return error.InvalidCheckpointStructure;
 
-    const version = try reader.readInt(u32, .little);
-    if (version != DISTRIBUTED_CHECKPOINT_VERSION) return error.UnsupportedCheckpointVersion;
-
-    _ = try reader.readInt(u64, .little);
-    const model_dim_u64 = try reader.readInt(u64, .little);
-    const layer_count_u64 = try reader.readInt(u64, .little);
-    const vocab_size_u64 = try reader.readInt(u64, .little);
-    _ = try reader.readInt(u64, .little);
-    _ = try checkpointReadF32(&reader);
-    _ = try checkpointReadF32(&reader);
+    const metadata = checkpoint_schema.readMetadata(&reader) catch |err| switch (err) {
+        error.InvalidFloat, error.InvalidBoolean => return error.InvalidCheckpointStructure,
+        else => return err,
+    };
+    const model_dim_u64 = metadata.model_dim;
+    const layer_count_u64 = metadata.layer_count;
+    const vocab_size_u64 = metadata.vocab_size;
+    const clip_min = metadata.clip_min;
+    const clip_max = metadata.clip_max;
 
     if (model_dim_u64 == 0 or model_dim_u64 > MAX_DISTRIBUTED_MODEL_DIM or model_dim_u64 % 2 != 0) return error.InvalidCheckpointModel;
     if (layer_count_u64 == 0 or layer_count_u64 > MAX_DISTRIBUTED_LAYER_COUNT) return error.InvalidCheckpointModel;
     if (vocab_size_u64 == 0 or vocab_size_u64 > MAX_DISTRIBUTED_VOCAB_SIZE) return error.InvalidCheckpointVocabulary;
+    if (!(clip_min < clip_max)) return error.InvalidCheckpointClipRange;
 
     const model_dim: usize = @intCast(model_dim_u64);
     const layer_count: usize = @intCast(layer_count_u64);
     const vocab_size: usize = @intCast(vocab_size_u64);
     const rsf_dim = model_dim / 2;
-    const matrix_length = std.math.mul(usize, rsf_dim, rsf_dim + 1) catch return error.InvalidCheckpointModel;
-    const layer_matrix_bytes = std.math.mul(usize, matrix_length, @sizeOf(f32) * 4) catch return error.InvalidCheckpointModel;
-    const layer_record_bytes = std.math.add(usize, layer_matrix_bytes, @sizeOf(u64) * 4) catch return error.InvalidCheckpointModel;
-    const all_layer_bytes = std.math.mul(usize, layer_record_bytes, layer_count) catch return error.InvalidCheckpointModel;
-    if (@as(u64, @intCast(all_layer_bytes)) > stat.size) return error.InvalidCheckpointStructure;
+    const columns = std.math.add(usize, rsf_dim, 1) catch return error.InvalidCheckpointModel;
+    const matrix_length = std.math.mul(usize, rsf_dim, columns) catch return error.InvalidCheckpointModel;
+    const stack_length = std.math.mul(usize, matrix_length, layer_count) catch return error.InvalidCheckpointModel;
+    const stack_state_bytes = std.math.mul(usize, stack_length, @sizeOf(f32) * 6) catch return error.InvalidCheckpointModel;
+    if (stack_state_bytes > stat.size) return error.InvalidCheckpointStructure;
+
+    const master_s = try allocator.alloc(f32, stack_length);
+    defer allocator.free(master_s);
+    const master_t = try allocator.alloc(f32, stack_length);
+    defer allocator.free(master_t);
+    try checkpointReadExpectedF32Array(&reader, master_s, false);
+    try checkpointReadExpectedF32Array(&reader, master_t, false);
+    try checkpointValidateExpectedF32Array(&reader, stack_length, false);
+    try checkpointValidateExpectedF32Array(&reader, stack_length, false);
+    try checkpointValidateExpectedF32Array(&reader, stack_length, true);
+    try checkpointValidateExpectedF32Array(&reader, stack_length, true);
 
     var model = try ModelFormat.init(allocator, "JAIDE Distributed Checkpoint", "Distributed trainer checkpoint");
     errdefer model.deinit();
-
     const rsf_ptr = try allocator.create(RSF);
     var rsf_committed = false;
     errdefer if (!rsf_committed) allocator.destroy(rsf_ptr);
     rsf_ptr.* = try RSF.initWithConfig(allocator, rsf_dim, layer_count, .{});
     model.setRSF(rsf_ptr);
     rsf_committed = true;
-
-    for (rsf_ptr.ctrl.?.layers) |*layer| {
-        if (try reader.readInt(u64, .little) != matrix_length) return error.InvalidCheckpointWeights;
-        try checkpointReadArray(&reader, layer.s_weight.data);
-
-        if (try reader.readInt(u64, .little) != matrix_length) return error.InvalidCheckpointWeights;
-        try checkpointReadArray(&reader, layer.t_weight.data);
-
-        if (try reader.readInt(u64, .little) != matrix_length) return error.InvalidCheckpointWeights;
-        try checkpointSkipF32Array(&reader, matrix_length);
-        if (try reader.readInt(u64, .little) != matrix_length) return error.InvalidCheckpointWeights;
-        try checkpointSkipF32Array(&reader, matrix_length);
-    }
-
-    const clip_min = try checkpointReadF32(&reader);
-    const clip_max = try checkpointReadF32(&reader);
-    if (!(clip_min < clip_max)) return error.InvalidCheckpointClipRange;
-    rsf_ptr.ctrl.?.cfg.clip_min = clip_min;
-    rsf_ptr.ctrl.?.cfg.clip_max = clip_max;
-    for (rsf_ptr.ctrl.?.layers) |*layer| {
+    for (rsf_ptr.ctrl.?.layers, 0..) |*layer, layer_index| {
+        const start = layer_index * matrix_length;
+        for (layer.s_weight.data, master_s[start .. start + matrix_length]) |*destination, source| destination.* = checkpointForwardShadow(source);
+        for (layer.t_weight.data, master_t[start .. start + matrix_length]) |*destination, source| destination.* = checkpointForwardShadow(source);
         layer.clip_min = clip_min;
         layer.clip_max = clip_max;
     }
+    rsf_ptr.ctrl.?.cfg.clip_min = clip_min;
+    rsf_ptr.ctrl.?.cfg.clip_max = clip_max;
 
     const has_embedding = try reader.readByte();
     if (has_embedding != 1) return error.MissingCheckpointEmbedding;
     const embedding_vocab_u64 = try reader.readInt(u64, .little);
     const embedding_dim_u64 = try reader.readInt(u64, .little);
+    _ = try reader.readInt(u64, .little);
     if (embedding_vocab_u64 != vocab_size_u64 or embedding_dim_u64 != model_dim_u64) return error.InvalidCheckpointEmbedding;
-    const embedding_elements_u64 = try reader.readInt(u64, .little);
-    const embedding_elements = std.math.cast(usize, embedding_elements_u64) orelse return error.InvalidCheckpointEmbedding;
-    const expected_embedding_elements = std.math.mul(usize, vocab_size, model_dim) catch return error.InvalidCheckpointEmbedding;
-    if (embedding_elements != expected_embedding_elements) return error.InvalidCheckpointEmbedding;
+    const embedding_elements = std.math.mul(usize, vocab_size, model_dim) catch return error.InvalidCheckpointEmbedding;
+    const embedding_state_bytes = std.math.mul(usize, embedding_elements, @sizeOf(f32) * 3) catch return error.InvalidCheckpointEmbedding;
+    if (embedding_state_bytes > stat.size) return error.InvalidCheckpointStructure;
     const embedding_weights = try allocator.alloc(f32, embedding_elements);
     defer allocator.free(embedding_weights);
-    try checkpointReadArray(&reader, embedding_weights);
-    const velocity_elements_u64 = try reader.readInt(u64, .little);
-    if (velocity_elements_u64 != embedding_elements_u64) return error.InvalidCheckpointEmbedding;
-    try checkpointSkipF32Array(&reader, embedding_elements);
+    try checkpointReadExpectedF32Array(&reader, embedding_weights, false);
+    for (embedding_weights) |*weight| weight.* = checkpointForwardShadow(weight.*);
+    try checkpointValidateExpectedF32Array(&reader, embedding_elements, false);
+    try checkpointValidateExpectedF32Array(&reader, embedding_elements, true);
     model.embedding = try LearnedEmbedding.initWithWeights(allocator, vocab_size, model_dim, embedding_weights);
 
     const has_target_source = try reader.readByte();
@@ -270,11 +301,7 @@ fn loadDistributedCheckpoint(allocator: Allocator, path: []const u8) !ModelForma
         const target_vocab = try reader.readInt(u64, .little);
         const target_dim = try reader.readInt(u64, .little);
         if (target_vocab != vocab_size_u64 or target_dim != model_dim_u64) return error.InvalidCheckpointEmbedding;
-        const target_elements = try reader.readInt(u64, .little);
-        const expected_target_elements = std.math.mul(u64, vocab_size_u64, model_dim_u64) catch return error.InvalidCheckpointEmbedding;
-        if (target_elements != expected_target_elements) return error.InvalidCheckpointEmbedding;
-        var target_index: u64 = 0;
-        while (target_index < target_elements) : (target_index += 1) _ = try checkpointReadF32(&reader);
+        try checkpointValidateExpectedF32Array(&reader, embedding_elements, false);
     }
 
     var nonce: [32]u8 = undefined;
@@ -300,7 +327,7 @@ fn loadDistributedCheckpoint(allocator: Allocator, path: []const u8) !ModelForma
     errdefer tokenizer_ptr.deinit();
     try tokenizer_ptr.loadVocab(tokenizer_path);
     if (tokenizer_ptr.vocabSize() != vocab_size) return error.InvalidCheckpointVocabulary;
-    if (try reader.readInt(u32, .little) != 0xDEADBEEF) return error.InvalidCheckpointTrailer;
+    if (try reader.readInt(u32, .little) != checkpoint_schema.TRAILER) return error.InvalidCheckpointTrailer;
     if (reader.crc.final() != try reader.inner.readInt(u32, .little)) return error.CheckpointChecksumMismatch;
     _ = reader.inner.readByte() catch |err| {
         if (err != error.EndOfStream) return err;
@@ -317,7 +344,7 @@ fn isDistributedCheckpoint(path: []const u8) !bool {
     var magic: [8]u8 = undefined;
     const bytes_read = file.read(&magic) catch return error.InvalidCheckpointStructure;
     if (bytes_read != magic.len) return false;
-    return mem.eql(u8, magic[0..], DISTRIBUTED_CHECKPOINT_MAGIC);
+    return mem.eql(u8, magic[0..], DISTRIBUTED_CHECKPOINT_MAGIC[0..]);
 }
 
 pub const ServerConfig = struct {
@@ -2331,3 +2358,9 @@ pub const BatchInferenceRequest = struct {
         allocator.free(self.texts);
     }
 };
+
+test "distributed checkpoint forward shadows match f16 storage" {
+    try std.testing.expectEqual(@as(f32, 65504.0), checkpointForwardShadow(70000.0));
+    try std.testing.expectEqual(@as(f32, -65504.0), checkpointForwardShadow(-70000.0));
+    try std.testing.expectEqual(@as(f32, @floatCast(@as(f16, @floatCast(0.12345)))), checkpointForwardShadow(0.12345));
+}

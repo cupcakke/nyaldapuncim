@@ -1,5 +1,6 @@
 const std = @import("std");
 const GPUCoordinator = @import("distributed/gpu_coordinator.zig").GPUCoordinator;
+const dataset_partition = @import("distributed/dataset_partition.zig");
 const dtf = @import("distributed/distributed_trainer_futhark.zig");
 const DistributedTrainerFuthark = dtf.DistributedTrainerFuthark;
 const TrainerConfig = dtf.TrainerConfig;
@@ -108,6 +109,39 @@ fn fnv1aHashBytes(data: []const u8) u64 {
     return hash;
 }
 
+fn parseOptionalEnvironmentUsize(allocator: std.mem.Allocator, name: []const u8) !?usize {
+    const owned = std.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(owned);
+    if (owned.len == 0) return error.InvalidEnvironmentValue;
+    return std.fmt.parseInt(usize, owned, 10) catch return error.InvalidEnvironmentValue;
+}
+
+fn parseOptionalEnvironmentF32(allocator: std.mem.Allocator, name: []const u8) !?f32 {
+    const owned = std.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(owned);
+    if (owned.len == 0) return error.InvalidEnvironmentValue;
+    const value = std.fmt.parseFloat(f32, owned) catch return error.InvalidEnvironmentValue;
+    if (!std.math.isFinite(value)) return error.InvalidEnvironmentValue;
+    return value;
+}
+
+fn parseOptionalEnvironmentBool(allocator: std.mem.Allocator, name: []const u8) !?bool {
+    const owned = std.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(owned);
+    if (std.mem.eql(u8, owned, "1") or std.mem.eql(u8, owned, "true")) return true;
+    if (std.mem.eql(u8, owned, "0") or std.mem.eql(u8, owned, "false")) return false;
+    return error.InvalidEnvironmentValue;
+}
+
 fn loadDataset(
     allocator: std.mem.Allocator,
     coordinator: *GPUCoordinator,
@@ -117,23 +151,10 @@ fn loadDataset(
     if (coordinator.world_size == 0) return error.InvalidWorldSize;
     if (coordinator.rank >= coordinator.world_size) return error.InvalidRank;
 
-    const env_total_owned: ?[]u8 = std.process.getEnvVarOwned(
-        allocator,
-        "JAIDE_TOTAL_SAMPLES",
-    ) catch null;
-    defer if (env_total_owned) |owned| allocator.free(owned);
-
-    const env_max_owned: ?[]u8 = std.process.getEnvVarOwned(
-        allocator,
-        "JAIDE_MAX_SAMPLES",
-    ) catch null;
-    defer if (env_max_owned) |owned| allocator.free(owned);
-
-    var valid_sample_count: usize = 0;
-
-    if (env_total_owned) |value| {
-        valid_sample_count = std.fmt.parseInt(usize, value, 10) catch 0;
-    }
+    const environment_total = try parseOptionalEnvironmentUsize(allocator, "JAIDE_TOTAL_SAMPLES");
+    const environment_maximum = try parseOptionalEnvironmentUsize(allocator, "JAIDE_MAX_SAMPLES");
+    var valid_sample_count = environment_total orelse 0;
+    if (environment_total != null and valid_sample_count == 0) return error.InvalidEnvironmentValue;
 
     if (valid_sample_count == 0) {
         std.debug.print(
@@ -173,11 +194,9 @@ fn loadDataset(
         }
     }
 
-    if (env_max_owned) |value| {
-        const maximum = std.fmt.parseInt(usize, value, 10) catch 0;
-        if (maximum > 0 and maximum < valid_sample_count) {
-            valid_sample_count = maximum;
-        }
+    if (environment_maximum) |maximum| {
+        if (maximum == 0) return error.InvalidEnvironmentValue;
+        if (maximum < valid_sample_count) valid_sample_count = maximum;
     }
 
     if (valid_sample_count == 0) {
@@ -188,28 +207,10 @@ fn loadDataset(
         return error.EmptyDataset;
     }
 
-    const rounded_count = try std.math.add(
-        usize,
-        valid_sample_count,
-        coordinator.world_size - 1,
-    );
-    const samples_per_rank = rounded_count / coordinator.world_size;
-
-    if (samples_per_rank == 0) {
-        return error.EmptyDatasetPartition;
-    }
-
-    const unwrapped_start = try std.math.mul(
-        usize,
-        coordinator.rank,
-        samples_per_rank,
-    );
-    const start_valid_index = unwrapped_start % valid_sample_count;
-    const unwrapped_end = try std.math.add(
-        usize,
-        start_valid_index,
-        samples_per_rank,
-    );
+    const partition = try dataset_partition.bounds(valid_sample_count, coordinator.world_size, coordinator.rank);
+    const samples_per_rank = partition.count;
+    const start_valid_index = partition.start;
+    const end_valid_index = try std.math.add(usize, start_valid_index, samples_per_rank);
 
     var samples = std.ArrayList([]const u8).init(allocator);
     errdefer {
@@ -220,33 +221,14 @@ fn loadDataset(
     }
 
     try samples.ensureTotalCapacity(samples_per_rank);
-
-    const first_end = @min(unwrapped_end, valid_sample_count);
-    const first_count = try appendDatasetRange(
+    _ = try appendDatasetRange(
         allocator,
         dataset_path,
         max_line_size,
         start_valid_index,
-        first_end,
+        end_valid_index,
         &samples,
     );
-
-    const remaining = samples_per_rank - first_count;
-
-    if (remaining > 0) {
-        if (remaining > valid_sample_count) {
-            return error.InvalidDatasetPartition;
-        }
-
-        _ = try appendDatasetRange(
-            allocator,
-            dataset_path,
-            max_line_size,
-            0,
-            remaining,
-            &samples,
-        );
-    }
 
     if (samples.items.len != samples_per_rank) {
         std.debug.print(
@@ -272,21 +254,42 @@ fn loadDataset(
     return samples.toOwnedSlice();
 }
 
+fn loadDatasetHashes(
+    allocator: std.mem.Allocator,
+    dataset_path: []const u8,
+    max_line_size: usize,
+) ![]u64 {
+    const maximum = (try parseOptionalEnvironmentUsize(allocator, "JAIDE_MAX_SAMPLES")) orelse 0;
+    const file = try openDatasetFile(dataset_path);
+    defer file.close();
+    var buffered_reader = std.io.bufferedReader(file.reader());
+    var stream = buffered_reader.reader();
+    var hashes = std.ArrayList(u64).init(allocator);
+    errdefer hashes.deinit();
+    var seen = std.AutoHashMap(u64, void).init(allocator);
+    defer seen.deinit();
+    var valid_count: usize = 0;
+    while (maximum == 0 or valid_count < maximum) {
+        var arena = core_memory.ArenaAllocator.init(allocator, 64 * 1024);
+        defer arena.deinit();
+        const line = try stream.readUntilDelimiterOrEofAlloc(arena.allocator(), '\n', max_line_size) orelse break;
+        const text = try extractDatasetText(&arena, line) orelse continue;
+        valid_count = try std.math.add(usize, valid_count, 1);
+        const hash = fnv1aHashBytes(text);
+        if (seen.contains(hash)) continue;
+        try seen.put(hash, {});
+        try hashes.append(hash);
+    }
+    if (hashes.items.len == 0) return error.EmptyDataset;
+    return hashes.toOwnedSlice();
+}
+
 fn loadTokenizerDataset(
     allocator: std.mem.Allocator,
     dataset_path: []const u8,
     max_line_size: usize,
 ) ![][]const u8 {
-    const env_max_owned: ?[]u8 = std.process.getEnvVarOwned(
-        allocator,
-        "JAIDE_MAX_SAMPLES",
-    ) catch null;
-    defer if (env_max_owned) |owned| allocator.free(owned);
-
-    const maximum_samples: usize = if (env_max_owned) |value|
-        std.fmt.parseInt(usize, value, 10) catch 0
-    else
-        0;
+    const maximum_samples = (try parseOptionalEnvironmentUsize(allocator, "JAIDE_MAX_SAMPLES")) orelse 0;
 
     const file = try openDatasetFile(dataset_path);
     defer file.close();
@@ -349,6 +352,8 @@ const EpochArtifactWorker = struct {
     capture_done: bool,
     capture_failure: ?anyerror,
     write_failure: ?anyerror,
+    capture_duration_ns: u64,
+    write_duration_ns: u64,
     thread: ?std.Thread,
 
     fn start(
@@ -367,6 +372,8 @@ const EpochArtifactWorker = struct {
             .capture_done = false,
             .capture_failure = null,
             .write_failure = null,
+            .capture_duration_ns = 0,
+            .write_duration_ns = 0,
             .thread = null,
         };
         worker.thread = try std.Thread.spawn(.{}, EpochArtifactWorker.run, .{worker});
@@ -374,6 +381,7 @@ const EpochArtifactWorker = struct {
     }
 
     fn run(self: *EpochArtifactWorker) void {
+        const capture_started = std.time.nanoTimestamp();
         const snapshot = self.trainer.captureCheckpointSnapshot() catch |err| {
             self.mutex.lock();
             self.capture_failure = err;
@@ -382,24 +390,32 @@ const EpochArtifactWorker = struct {
             self.mutex.unlock();
             return;
         };
+        const capture_elapsed = std.time.nanoTimestamp() - capture_started;
         self.mutex.lock();
+        self.capture_duration_ns = if (capture_elapsed > 0) @intCast(capture_elapsed) else 0;
         self.capture_done = true;
         self.condition.broadcast();
         self.mutex.unlock();
 
+        const write_started = std.time.nanoTimestamp();
         DistributedTrainerFuthark.writeCheckpointSnapshotFile(snapshot, self.checkpoint_path) catch |err| {
             self.mutex.lock();
             self.write_failure = err;
             self.mutex.unlock();
         };
+        const write_elapsed = std.time.nanoTimestamp() - write_started;
         snapshot.deinit();
         self.allocator.destroy(snapshot);
 
         self.mutex.lock();
+        self.write_duration_ns = if (write_elapsed > 0) @intCast(write_elapsed) else 0;
         const failed = self.capture_failure != null or self.write_failure != null;
         self.mutex.unlock();
         if (!failed) {
-            std.debug.print("Checkpoint saved (async): {s}\n", .{self.checkpoint_path});
+            std.debug.print(
+                "Checkpoint saved: {s} capture_ms={d} write_ms={d}\n",
+                .{ self.checkpoint_path, self.capture_duration_ns / std.time.ns_per_ms, self.write_duration_ns / std.time.ns_per_ms },
+            );
         }
     }
 
@@ -720,6 +736,8 @@ pub fn main() !void {
         return deployToModal(allocator, args[2..]);
     }
 
+    const startup_started = std.time.nanoTimestamp();
+
     const world_size_string = try std.process.getEnvVarOwned(
         allocator,
         "WORLD_SIZE",
@@ -907,7 +925,6 @@ pub fn main() !void {
     }
 
     var coordinator = try GPUCoordinator.init(
-        allocator,
         world_size,
         rank,
         local_rank,
@@ -1000,6 +1017,16 @@ pub fn main() !void {
     else
         20;
 
+    const checkpoint_interval_owned: ?[]u8 = std.process.getEnvVarOwned(
+        allocator,
+        "JAIDE_CHECKPOINT_INTERVAL_EPOCHS",
+    ) catch null;
+    defer if (checkpoint_interval_owned) |owned| allocator.free(owned);
+    const checkpoint_interval_epochs: usize = if (checkpoint_interval_owned) |value|
+        std.fmt.parseInt(usize, value, 10) catch return error.InvalidConfig
+    else
+        5;
+
     const learning_rate_string_owned: ?[]u8 = std.process.getEnvVarOwned(
         allocator,
         "JAIDE_LEARNING_RATE",
@@ -1015,7 +1042,7 @@ pub fn main() !void {
             return error.InvalidConfig;
         }
     else
-        0.0001;
+        0.0003;
 
     if (!std.math.isFinite(learning_rate) or learning_rate <= 0.0) {
         return error.InvalidConfig;
@@ -1168,38 +1195,23 @@ pub fn main() !void {
         return error.InvalidConfig;
     };
 
-    const shuffle_control_string_owned: ?[]u8 = std.process.getEnvVarOwned(
-        allocator,
-        "JAIDE_SHUFFLE_TARGET_CONTROL",
-    ) catch null;
-    defer if (shuffle_control_string_owned) |owned| allocator.free(owned);
-
-    const shuffle_target_control: bool = if (shuffle_control_string_owned) |value|
-        std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "true")
-    else
-        false;
-
-    const frozen_target_string_owned: ?[]u8 = std.process.getEnvVarOwned(
-        allocator,
-        "JAIDE_TARGET_SOURCE_FROZEN",
-    ) catch null;
-    defer if (frozen_target_string_owned) |owned| allocator.free(owned);
-
-    const target_source_frozen: bool = if (frozen_target_string_owned) |value|
-        !(std.mem.eql(u8, value, "0") or std.mem.eql(u8, value, "false"))
-    else
-        true;
-
-    const depth_compensation_string_owned: ?[]u8 = std.process.getEnvVarOwned(
-        allocator,
-        "JAIDE_SPECTRAL_DEPTH_COMPENSATION",
-    ) catch null;
-    defer if (depth_compensation_string_owned) |owned| allocator.free(owned);
-
-    const spectral_depth_compensation: bool = if (depth_compensation_string_owned) |value|
-        !(std.mem.eql(u8, value, "0") or std.mem.eql(u8, value, "false"))
-    else
-        true;
+    const shuffle_target_control = (try parseOptionalEnvironmentBool(allocator, "JAIDE_SHUFFLE_TARGET_CONTROL")) orelse false;
+    const target_source_frozen = (try parseOptionalEnvironmentBool(allocator, "JAIDE_TARGET_SOURCE_FROZEN")) orelse true;
+    const spectral_depth_compensation = (try parseOptionalEnvironmentBool(allocator, "JAIDE_SPECTRAL_DEPTH_COMPENSATION")) orelse true;
+    const grad_mean = (try parseOptionalEnvironmentBool(allocator, "JAIDE_GRAD_MEAN")) orelse true;
+    const use_normalized_gradient_flow = (try parseOptionalEnvironmentBool(allocator, "JAIDE_NORMALIZED_GRADIENT_FLOW")) orelse true;
+    const spectral_target_norm = (try parseOptionalEnvironmentF32(allocator, "JAIDE_SPECTRAL_NORM_TARGET")) orelse 0.9;
+    const spectral_iterations = (try parseOptionalEnvironmentUsize(allocator, "JAIDE_SPECTRAL_POWER_ITERATIONS")) orelse 30;
+    const spectral_interval = (try parseOptionalEnvironmentUsize(allocator, "JAIDE_SPECTRAL_INTERVAL")) orelse 10;
+    const trust_ratio = (try parseOptionalEnvironmentF32(allocator, "JAIDE_SFD_TRUST_RATIO")) orelse 0.1;
+    const weight_floor = (try parseOptionalEnvironmentF32(allocator, "JAIDE_SFD_WEIGHT_FLOOR")) orelse 1e-3;
+    const gradient_clip_norm = (try parseOptionalEnvironmentF32(allocator, "JAIDE_GRADIENT_CLIP_NORM")) orelse 1.0;
+    const logdet_weight = (try parseOptionalEnvironmentF32(allocator, "JAIDE_LOGDET_WEIGHT")) orelse dtf.fused_logdet_weight_default;
+    const checkpoint_version = (try parseOptionalEnvironmentUsize(allocator, "JAIDE_CHECKPOINT_VERSION")) orelse dtf.CHECKPOINT_VERSION;
+    const seed_offset = (try parseOptionalEnvironmentUsize(allocator, "JAIDE_SEED_OFFSET")) orelse 0;
+    const embedding_seed = std.math.add(u64, 42, std.math.cast(u64, seed_offset) orelse return error.InvalidConfig) catch return error.InvalidConfig;
+    if (checkpoint_version != dtf.CHECKPOINT_VERSION) return error.InvalidConfig;
+    if (spectral_target_norm <= 0.0 or spectral_interval == 0 or trust_ratio <= 0.0 or trust_ratio > 1.0 or weight_floor <= 0.0 or gradient_clip_norm <= 0.0) return error.InvalidConfig;
 
     const dataset_path_owned: ?[]u8 = std.process.getEnvVarOwned(
         allocator,
@@ -1215,6 +1227,7 @@ pub fn main() !void {
         .{ rank, dataset_path },
     );
 
+    const dataset_started = std.time.nanoTimestamp();
     const samples = try loadDataset(
         allocator,
         &coordinator,
@@ -1227,6 +1240,8 @@ pub fn main() !void {
         }
         allocator.free(samples);
     }
+    const dataset_elapsed = std.time.nanoTimestamp() - dataset_started;
+    std.debug.print("[Rank {d}] dataset_ms={d} local_samples={d}\n", .{ rank, @divTrunc(dataset_elapsed, std.time.ns_per_ms), samples.len });
 
     const vocab_path_owned: ?[]u8 = std.process.getEnvVarOwned(
         allocator,
@@ -1263,6 +1278,7 @@ pub fn main() !void {
     else
         false;
 
+    const tokenizer_started = std.time.nanoTimestamp();
     if (!vocab_ready) {
         var vocabulary_error: ?anyerror = null;
 
@@ -1349,6 +1365,7 @@ pub fn main() !void {
         );
     }
 
+    var model_initialization_elapsed: i128 = 0;
     var tokenizer = try MGT.init(
         allocator,
         &.{},
@@ -1383,18 +1400,24 @@ pub fn main() !void {
             return err;
         };
 
+        const tokenizer_elapsed = std.time.nanoTimestamp() - tokenizer_started;
         std.debug.print(
-            "[Rank {d}] Tokenizer loaded, next_token_id={d}\n",
-            .{ rank, tokenizer.next_token_id },
+            "[Rank {d}] Tokenizer loaded, next_token_id={d} tokenizer_ms={d}\n",
+            .{ rank, tokenizer.next_token_id, @divTrunc(tokenizer_elapsed, std.time.ns_per_ms) },
         );
 
         var trainer_config: TrainerConfig = .{};
+        trainer_config.checkpoint_version = @intCast(checkpoint_version);
         trainer_config.learning_rate = learning_rate;
-        trainer_config.spectral_iterations = 30;
-        trainer_config.spectral_target_norm = 0.9;
+        trainer_config.embedding_seed = embedding_seed;
+        trainer_config.spectral_iterations = spectral_iterations;
+        trainer_config.spectral_target_norm = spectral_target_norm;
+        trainer_config.spectral_interval = @intCast(spectral_interval);
         trainer_config.clip_min = clip_min;
         trainer_config.clip_max = clip_max;
-        trainer_config.grad_mean = true;
+        trainer_config.grad_mean = grad_mean;
+        trainer_config.use_normalized_gradient_flow = use_normalized_gradient_flow;
+        trainer_config.gradient_clip_norm = gradient_clip_norm;
         trainer_config.reasoning_cycles = reasoning_cycles;
         trainer_config.relational_pass_interval = relational_pass_interval;
         trainer_config.reconstruction_alpha = reconstruction_alpha;
@@ -1403,12 +1426,16 @@ pub fn main() !void {
         trainer_config.shuffle_target_control = shuffle_target_control;
         trainer_config.target_source_frozen = target_source_frozen;
         trainer_config.spectral_depth_compensation = spectral_depth_compensation;
+        trainer_config.trust_ratio = trust_ratio;
+        trainer_config.weight_floor = weight_floor;
+        trainer_config.logdet_weight = logdet_weight;
 
         const components = TrainerComponents{
             .tokenizer = tokenizer,
         };
 
-        break :trainer_initialization try DistributedTrainerFuthark.initWithComponents(
+        const model_initialization_started = std.time.nanoTimestamp();
+        const initialized_trainer = try DistributedTrainerFuthark.initWithComponents(
             allocator,
             &coordinator,
             model_dim,
@@ -1417,8 +1444,35 @@ pub fn main() !void {
             trainer_config,
             components,
         );
+        model_initialization_elapsed = std.time.nanoTimestamp() - model_initialization_started;
+        break :trainer_initialization initialized_trainer;
     };
     defer trainer.deinit();
+    std.debug.print("[Rank {d}] model_compile_initialization_ms={d}\n", .{ rank, @divTrunc(model_initialization_elapsed, std.time.ns_per_ms) });
+
+    const resume_checkpoint_owned = std.process.getEnvVarOwned(allocator, "JAIDE_RESUME_CHECKPOINT") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    defer if (resume_checkpoint_owned) |path| allocator.free(path);
+    var resume_error: ?anyerror = null;
+    if (resume_checkpoint_owned) |path| {
+        if (path.len == 0) return error.InvalidEnvironmentValue;
+        trainer.loadCheckpoint(path) catch |err| {
+            resume_error = err;
+        };
+    }
+    synchronizeStageStatus(
+        allocator,
+        &coordinator,
+        nccl_id_path,
+        "checkpoint_restore",
+        resume_error,
+    ) catch |err| {
+        std.debug.print("[Rank {d}] checkpoint restore stage failed: {}\n", .{ rank, err });
+        return err;
+    };
+    const resumed_from_checkpoint = resume_checkpoint_owned != null;
 
     std.debug.print(
         "[Rank {d}] learning_rate={d}\n",
@@ -1431,6 +1485,10 @@ pub fn main() !void {
     std.debug.print(
         "[Rank {d}] target_source_frozen={} shuffle_target_control={} spectral_depth_compensation={}\n",
         .{ rank, target_source_frozen, shuffle_target_control, spectral_depth_compensation },
+    );
+    std.debug.print(
+        "[Rank {d}] grad_mean={} normalized_gradient_flow={} gradient_clip={d} trust_ratio={d} weight_floor={d} logdet_weight={d} spectral_target={d} spectral_iterations={d} spectral_interval={d}\n",
+        .{ rank, grad_mean, use_normalized_gradient_flow, gradient_clip_norm, trust_ratio, weight_floor, logdet_weight, spectral_target_norm, spectral_iterations, spectral_interval },
     );
     std.debug.print(
         "[Rank {d}] Futhark trainer initialized with model_dim={d}, layers={d}\n",
@@ -1465,9 +1523,11 @@ pub fn main() !void {
         );
     }
 
+    const graph_started = std.time.nanoTimestamp();
     var graph_stage_error: ?anyerror = null;
 
     graph_construction: {
+        if (resumed_from_checkpoint) break :graph_construction;
         if (coordinator.isRoot()) {
             std.debug.print(
                 "[Rank {d}] Knowledge graph construction: encoding {d} samples (GPU)...\n",
@@ -1475,34 +1535,24 @@ pub fn main() !void {
             );
         }
 
-        var sample_hashes = std.ArrayList(u64).init(allocator);
-        defer sample_hashes.deinit();
+        const sample_hashes = loadDatasetHashes(allocator, dataset_path, 16 * 1024 * 1024) catch |err| {
+            graph_stage_error = err;
+            break :graph_construction;
+        };
+        defer allocator.free(sample_hashes);
 
-        for (samples) |text| {
-            if (text.len == 0) continue;
-            const h = fnv1aHashBytes(std.mem.sliceAsBytes(text));
-            sample_hashes.append(h) catch |err| {
-                std.debug.print(
-                    "[Rank {d}] graph-construction: sample_hashes.append (i={d}) failed: {}\n",
-                    .{ rank, sample_hashes.items.len, err },
-                );
-                graph_stage_error = err;
-                break :graph_construction;
-            };
-        }
-
-        if (sample_hashes.items.len > 0) {
+        if (sample_hashes.len > 0) {
             const graph_ctx = &trainer.accelerator.ctx;
 
-            var gpu_result = accel_interface.batchEncodeGraphBitmask(
+            var gpu_result = accel_interface.batchEncodeGraph(
                 graph_ctx,
-                sample_hashes.items,
+                sample_hashes,
                 0,
                 allocator,
             ) catch |err| {
                 std.debug.print(
-                    "[Rank {d}] graph-construction: batchEncodeGraphBitmask failed: {} (n={d} hashes)\n",
-                    .{ rank, err, sample_hashes.items.len },
+                    "[Rank {d}] graph-construction: batchEncodeGraph failed: {} (n={d} hashes)\n",
+                    .{ rank, err, sample_hashes.len },
                 );
                 graph_stage_error = err;
                 break :graph_construction;
@@ -1526,37 +1576,6 @@ pub fn main() !void {
                 break :graph_construction;
             };
 
-            bitmask_warmup: {
-                const warmup_node_total = gpu_result.node_count;
-                if (warmup_node_total == 0) break :bitmask_warmup;
-                const warmup_signal = allocator.alloc(f32, warmup_node_total) catch break :bitmask_warmup;
-                defer allocator.free(warmup_signal);
-                for (warmup_signal) |*value| value.* = 1.0;
-                const propagated_signal = accel_interface.bitmaskPropagateSignalHost(
-                    graph_ctx,
-                    &gpu_result.bitmask,
-                    warmup_signal,
-                    2,
-                    0.5,
-                    allocator,
-                ) catch |err| {
-                    std.debug.print(
-                        "[Rank {d}] graph-construction: bitmask signal warmup failed: {}\n",
-                        .{ rank, err },
-                    );
-                    break :bitmask_warmup;
-                };
-                defer allocator.free(propagated_signal);
-                var activation_sum: f64 = 0.0;
-                for (propagated_signal) |value| activation_sum += value;
-                if (coordinator.isRoot()) {
-                    std.debug.print(
-                        "[Rank {d}] SSRG bitmask propagation warmup: nodes={d} edges={d} mean_activation={d:.6}\n",
-                        .{ rank, gpu_result.node_count, gpu_result.edge_count, activation_sum / @as(f64, @floatFromInt(warmup_node_total)) },
-                    );
-                }
-            }
-
             if (coordinator.isRoot()) {
                 std.debug.print(
                     "[Rank {d}] Knowledge graph: {d} nodes encoded via GPU\n",
@@ -1565,31 +1584,14 @@ pub fn main() !void {
             }
         }
 
-        trainer.signal_engine.propagateStep() catch |err| {
+        trainer.r_gpu.distributeGraphFast(trainer.nsir_graph) catch |err| {
             std.debug.print(
-                "[Rank {d}] graph-construction: signal propagateStep failed: {}\n",
+                "[Rank {d}] graph-construction: distributeGraphFast failed: {}\n",
                 .{ rank, err },
             );
             graph_stage_error = err;
             break :graph_construction;
         };
-
-        const p2p_report = trainer.r_gpu.distributeGraphP2P(
-            trainer.nsir_graph,
-        ) catch |err| {
-            std.debug.print(
-                "[Rank {d}] graph-construction: distributeGraphP2P failed: {}\n",
-                .{ rank, err },
-            );
-            graph_stage_error = err;
-            break :graph_construction;
-        };
-        if (p2p_report.p2p_used) {
-            std.debug.print(
-                "[Rank {d}] Graph adjacency shards staged via GPUDirect P2P: devices={d} shards={d} bytes={d} nvlink5_mesh={}\n",
-                .{ rank, p2p_report.devices_used, p2p_report.shards_staged, p2p_report.bytes_moved, p2p_report.nvlink5_mesh },
-            );
-        }
     }
 
     synchronizeStageStatus(
@@ -1609,10 +1611,16 @@ pub fn main() !void {
         return err;
     };
 
+    const graph_elapsed = std.time.nanoTimestamp() - graph_started;
     std.debug.print(
-        "[Rank {d}] Knowledge graph populated and distributed\n",
-        .{rank},
+        if (resumed_from_checkpoint)
+            "[Rank {d}] Knowledge graph restored from checkpoint graph_ms={d}\n"
+        else
+            "[Rank {d}] Knowledge graph populated and distributed graph_ms={d}\n",
+        .{ rank, @divTrunc(graph_elapsed, std.time.ns_per_ms) },
     );
+    const startup_elapsed = std.time.nanoTimestamp() - startup_started;
+    std.debug.print("[Rank {d}] startup_total_ms={d}\n", .{ rank, @divTrunc(startup_elapsed, std.time.ns_per_ms) });
 
     var loss_history = std.ArrayList(EpochMetric).init(allocator);
     defer loss_history.deinit();
@@ -1707,6 +1715,8 @@ pub fn main() !void {
             );
 
             checkpoint_creation: {
+                const epoch_number = epoch + 1;
+                if (checkpoint_interval_epochs == 0 or (epoch_number % checkpoint_interval_epochs != 0 and epoch_number != num_epochs)) break :checkpoint_creation;
                 std.fs.makeDirAbsolute("/checkpoints") catch |err| switch (err) {
                     error.PathAlreadyExists => {},
                     else => {
@@ -1787,6 +1797,11 @@ pub fn main() !void {
                     epoch_artifact_error = epoch_artifact_error orelse err;
                     break :checkpoint_creation;
                 };
+                artifact_worker.?.awaitCapture() catch |err| {
+                    checkpoint_failures += 1;
+                    epoch_artifact_error = epoch_artifact_error orelse err;
+                    break :checkpoint_creation;
+                };
             }
 
             if (epoch_artifact_error == null) {
@@ -1825,6 +1840,7 @@ pub fn main() !void {
         };
     }
 
+    var final_artifact_error: ?anyerror = null;
     if (artifact_worker) |final_worker| {
         if (final_worker.joinAndDestroy()) |err| {
             std.debug.print(
@@ -1832,9 +1848,20 @@ pub fn main() !void {
                 .{err},
             );
             checkpoint_failures += 1;
+            final_artifact_error = err;
         }
         artifact_worker = null;
     }
+    synchronizeStageStatus(
+        allocator,
+        &coordinator,
+        nccl_id_path,
+        "final_checkpoint_write",
+        final_artifact_error,
+    ) catch |err| {
+        std.debug.print("[Rank {d}] final checkpoint write stage failed: {}\n", .{ rank, err });
+        return err;
+    };
 
     if (coordinator.isRoot()) {
         std.debug.print(

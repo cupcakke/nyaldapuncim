@@ -1,6 +1,5 @@
 const std = @import("std");
 const nccl = @import("nccl_bindings.zig");
-const Allocator = std.mem.Allocator;
 
 fn constOpaquePtrFrom(value: anytype) !*const anyopaque {
     const T = @TypeOf(value);
@@ -80,11 +79,8 @@ pub const GPUCoordinator = struct {
     device_id: i32,
     nccl_comm: ?*nccl.ncclComm,
     cuda_stream: ?*anyopaque,
-    barrier_buffer: ?*anyopaque,
 
-    pub fn init(allocator: Allocator, world_size: usize, rank: usize, local_rank: usize, nccl_id: nccl.ncclUniqueId) !GPUCoordinator {
-        _ = allocator;
-
+    pub fn init(world_size: usize, rank: usize, local_rank: usize, nccl_id: nccl.ncclUniqueId) !GPUCoordinator {
         if (world_size == 0) {
             return error.InvalidWorldSize;
         }
@@ -138,21 +134,12 @@ pub const GPUCoordinator = struct {
         try checkCuda(nccl.cudaStreamCreate(&cuda_stream_local), "cudaStreamCreate", error.CudaStreamCreateFailed);
         errdefer logCudaFailure(nccl.cudaStreamDestroy(cuda_stream_local), "cudaStreamDestroy(init rollback)");
 
-        var barrier_buf_local: ?*anyopaque = null;
-        try checkCuda(nccl.cudaMalloc(&barrier_buf_local, @sizeOf(f32)), "cudaMalloc(barrier)", error.CudaMallocFailed);
-        const barrier_buffer = barrier_buf_local orelse return error.CudaMallocFailed;
-        errdefer logCudaFailure(nccl.cudaFree(barrier_buffer), "cudaFree(barrier init rollback)");
-
-        try checkCuda(nccl.cudaMemset(barrier_buffer, 0, @sizeOf(f32)), "cudaMemset(barrier)", error.CudaMemsetFailed);
-        try checkCuda(nccl.cudaDeviceSynchronize(), "cudaDeviceSynchronize(barrier init)", error.CudaSynchronizeFailed);
-
         return GPUCoordinator{
             .world_size = world_size,
             .rank = rank,
             .device_id = device_id,
             .nccl_comm = nccl_comm_opt,
             .cuda_stream = cuda_stream_local,
-            .barrier_buffer = barrier_buffer,
         };
     }
 
@@ -161,11 +148,6 @@ pub const GPUCoordinator = struct {
 
         if (self.cuda_stream) |stream| {
             logCudaFailure(nccl.cudaStreamSynchronize(stream), "cudaStreamSynchronize(deinit)");
-        }
-
-        if (self.barrier_buffer) |buffer| {
-            logCudaFailure(nccl.cudaFree(buffer), "cudaFree(barrier)");
-            self.barrier_buffer = null;
         }
 
         if (self.nccl_comm) |comm| {
@@ -251,16 +233,6 @@ pub const GPUCoordinator = struct {
         try self.doMemcpy(dst_ptr, src_ptr, size, nccl.cudaMemcpyKind.cudaMemcpyDeviceToHost, "cudaMemcpyDeviceToHost");
     }
 
-    pub fn copyDeviceToDevice(self: *GPUCoordinator, dst: anytype, src: anytype, size: usize) !void {
-        if (size == 0) {
-            return;
-        }
-
-        const dst_ptr = try opaquePtrFrom(dst);
-        const src_ptr = try constOpaquePtrFrom(src);
-        try self.doMemcpy(dst_ptr, src_ptr, size, nccl.cudaMemcpyKind.cudaMemcpyDeviceToDevice, "cudaMemcpyDeviceToDevice");
-    }
-
     fn doAllReduce(
         self: *GPUCoordinator,
         send_buf: *const anyopaque,
@@ -283,7 +255,7 @@ pub const GPUCoordinator = struct {
                     else => 4,
                 };
                 try checkCuda(
-                    nccl.cudaMemcpy(recv_buf, send_buf, count * elem_bytes, nccl.cudaMemcpyKind.cudaMemcpyDeviceToDevice),
+                    nccl.cudaMemcpy(recv_buf, send_buf, try std.math.mul(usize, count, elem_bytes), nccl.cudaMemcpyKind.cudaMemcpyDeviceToDevice),
                     tag ++ "(single-rank-copy)",
                     error.CudaMemcpyFailed,
                 );
@@ -306,145 +278,8 @@ pub const GPUCoordinator = struct {
         try self.doAllReduce(send_buf, recv_buf, count, .ncclFloat32, .ncclSum, "ncclAllReduceFloat32Sum");
     }
 
-    pub fn allReduceFloat16(self: *GPUCoordinator, send_buf: *const anyopaque, recv_buf: *anyopaque, count: usize) !void {
-        try self.doAllReduce(send_buf, recv_buf, count, .ncclFloat16, .ncclSum, "ncclAllReduceFloat16Sum");
-    }
-
-    /// In-place average across ranks (NCCL ncclAvg op, available since 2.10).
-    /// The result on every rank equals (sum of inputs) / world_size, computed
-    /// without leaving the GPU.
-    pub fn allReduceFloat16Avg(self: *GPUCoordinator, send_buf: *const anyopaque, recv_buf: *anyopaque, count: usize) !void {
-        try self.doAllReduce(send_buf, recv_buf, count, .ncclFloat16, .ncclAvg, "ncclAllReduceFloat16Avg");
-    }
-
-    pub fn allReduceFloat32Avg(self: *GPUCoordinator, send_buf: *const anyopaque, recv_buf: *anyopaque, count: usize) !void {
-        try self.doAllReduce(send_buf, recv_buf, count, .ncclFloat32, .ncclAvg, "ncclAllReduceFloat32Avg");
-    }
-
     pub fn allReduceFloat32Max(self: *GPUCoordinator, send_buf: *const anyopaque, recv_buf: *anyopaque, count: usize) !void {
         try self.doAllReduce(send_buf, recv_buf, count, .ncclFloat32, .ncclMax, "ncclAllReduceFloat32Max");
-    }
-
-    pub fn allReduceFloat32Min(self: *GPUCoordinator, send_buf: *const anyopaque, recv_buf: *anyopaque, count: usize) !void {
-        try self.doAllReduce(send_buf, recv_buf, count, .ncclFloat32, .ncclMin, "ncclAllReduceFloat32Min");
-    }
-
-    fn doBroadcast(
-        self: *GPUCoordinator,
-        send_buf: *const anyopaque,
-        recv_buf: *anyopaque,
-        count: usize,
-        dtype: nccl.ncclDataType_t,
-        root: usize,
-        comptime tag: []const u8,
-    ) !void {
-        if (count == 0) {
-            return;
-        }
-        if (root >= self.world_size) {
-            return error.InvalidRootRank;
-        }
-        if (root > @as(usize, @intCast(std.math.maxInt(c_int)))) {
-            return error.InvalidRootRank;
-        }
-        // Single-rank broadcast: root is the only rank and already has the data.
-        if (self.world_size == 1) {
-            if (send_buf != recv_buf) {
-                const elem_bytes: usize = switch (dtype) {
-                    .ncclFloat16 => 2,
-                    .ncclFloat32 => 4,
-                    else => 4,
-                };
-                try checkCuda(
-                    nccl.cudaMemcpy(recv_buf, send_buf, count * elem_bytes, nccl.cudaMemcpyKind.cudaMemcpyDeviceToDevice),
-                    tag ++ "(single-rank-copy)",
-                    error.CudaMemcpyFailed,
-                );
-            }
-            return;
-        }
-
-        const comm = try self.requireComm();
-        const stream = try self.requireStream();
-        try self.setDevice();
-
-        try checkNccl(
-            nccl.ncclBroadcast(send_buf, recv_buf, count, dtype, @intCast(root), comm, stream),
-            tag,
-            error.NCCLBroadcastFailed,
-        );
-    }
-
-    pub fn broadcastFloat32(self: *GPUCoordinator, buf: *anyopaque, count: usize, root: usize) !void {
-        try self.doBroadcast(buf, buf, count, .ncclFloat32, root, "ncclBroadcastFloat32");
-    }
-
-    pub fn broadcastFloat16(self: *GPUCoordinator, buf: *anyopaque, count: usize, root: usize) !void {
-        try self.doBroadcast(buf, buf, count, .ncclFloat16, root, "ncclBroadcastFloat16");
-    }
-
-    pub fn allGatherFloat32(
-        self: *GPUCoordinator,
-        send_buf: *const anyopaque,
-        recv_buf: *anyopaque,
-        send_count: usize,
-    ) !void {
-        if (send_count == 0) {
-            return;
-        }
-        // Single-rank allGather: recv_buf == send_buf (same shard, no peers).
-        if (self.world_size == 1) {
-            if (send_buf != recv_buf) {
-                try checkCuda(
-                    nccl.cudaMemcpy(recv_buf, send_buf, send_count * 4, nccl.cudaMemcpyKind.cudaMemcpyDeviceToDevice),
-                    "ncclAllGatherFloat32(single-rank-copy)",
-                    error.CudaMemcpyFailed,
-                );
-            }
-            return;
-        }
-
-        const comm = try self.requireComm();
-        const stream = try self.requireStream();
-        try self.setDevice();
-
-        try checkNccl(
-            nccl.ncclAllGather(send_buf, recv_buf, send_count, .ncclFloat32, comm, stream),
-            "ncclAllGatherFloat32",
-            error.NCCLAllGatherFailed,
-        );
-    }
-
-    pub fn reduceScatterFloat32(
-        self: *GPUCoordinator,
-        send_buf: *const anyopaque,
-        recv_buf: *anyopaque,
-        recv_count: usize,
-    ) !void {
-        if (recv_count == 0) {
-            return;
-        }
-        // Single-rank reduceScatter: output shard == full input (no peers to reduce).
-        if (self.world_size == 1) {
-            if (send_buf != recv_buf) {
-                try checkCuda(
-                    nccl.cudaMemcpy(recv_buf, send_buf, recv_count * 4, nccl.cudaMemcpyKind.cudaMemcpyDeviceToDevice),
-                    "ncclReduceScatterFloat32(single-rank-copy)",
-                    error.CudaMemcpyFailed,
-                );
-            }
-            return;
-        }
-
-        const comm = try self.requireComm();
-        const stream = try self.requireStream();
-        try self.setDevice();
-
-        try checkNccl(
-            nccl.ncclReduceScatter(send_buf, recv_buf, recv_count, .ncclFloat32, .ncclSum, comm, stream),
-            "ncclReduceScatterFloat32Sum",
-            error.NCCLReduceScatterFailed,
-        );
     }
 
     pub fn synchronize(self: *GPUCoordinator) !void {
@@ -457,38 +292,7 @@ pub const GPUCoordinator = struct {
         try checkCuda(pending_err, "cudaGetLastError", error.CudaSynchronizeFailed);
     }
 
-    pub fn deviceSynchronize(self: *GPUCoordinator) !void {
-        try self.setDevice();
-        try checkCuda(nccl.cudaDeviceSynchronize(), "cudaDeviceSynchronize", error.CudaSynchronizeFailed);
-
-        const pending_err = nccl.cudaGetLastError();
-        try checkCuda(pending_err, "cudaGetLastError(device)", error.CudaSynchronizeFailed);
-    }
-
-    pub fn barrier(self: *GPUCoordinator) !void {
-        // Single-GPU barrier: there is no other rank to synchronize with; a plain
-        // device synchronize is sufficient and avoids the uninitialized nccl_comm.
-        if (self.world_size == 1) {
-            try self.setDevice();
-            try checkCuda(nccl.cudaDeviceSynchronize(), "cudaDeviceSynchronize(barrier-single)", error.CudaSynchronizeFailed);
-            return;
-        }
-        const buf = self.barrier_buffer orelse return error.CoordinatorNotInitialized;
-        const comm = try self.requireComm();
-        const stream = try self.requireStream();
-
-        try self.setDevice();
-
-        try checkNccl(
-            nccl.ncclAllReduce(buf, buf, 1, .ncclFloat32, .ncclSum, comm, stream),
-            "ncclAllReduceBarrier",
-            error.NCCLAllReduceFailed,
-        );
-        try checkCuda(nccl.cudaStreamSynchronize(stream), "cudaStreamSynchronize(barrier)", error.CudaSynchronizeFailed);
-    }
-
     pub fn isRoot(self: *const GPUCoordinator) bool {
         return self.rank == 0;
     }
 };
-
