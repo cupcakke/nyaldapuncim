@@ -75,9 +75,6 @@ pub const ModalGPUClient = struct {
     http_client: http.Client,
     job_config: *const TrainingJobConfig,
 
-    /// `job_config` remains owned by the caller and must outlive the client.
-    /// This makes every resource and training parameter explicit at deployment
-    /// time instead of silently selecting a hardware or training profile.
     pub fn init(
         allocator: std.mem.Allocator,
         api_token: []const u8,

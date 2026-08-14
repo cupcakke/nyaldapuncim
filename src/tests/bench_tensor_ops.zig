@@ -3,7 +3,7 @@ const deps = @import("deps");
 const core = deps.core_tensor;
 const Tensor = deps.core_tensor.Tensor;
 
-const TENSOR_SIZE: usize = 1 << 22; // 4M elements
+const TENSOR_SIZE: usize = 1 << 22;
 const BENCH_ITERS: usize = 500;
 const BENCH_WARMUP: usize = 50;
 
@@ -19,13 +19,11 @@ fn benchFill(allocator: std.mem.Allocator) !BenchResult {
     var t = try Tensor.init(allocator, &shape);
     defer t.deinit();
 
-    // Warmup
     var w: usize = 0;
     while (w < BENCH_WARMUP) : (w += 1) {
         try t.fill(1.0);
     }
 
-    // Timed
     var timer = try std.time.Timer.start();
     var iter: usize = 0;
     while (iter < BENCH_ITERS) : (iter += 1) {
@@ -52,13 +50,11 @@ fn benchAdd(allocator: std.mem.Allocator) !BenchResult {
     try a.fill(1.0);
     try b.fill(0.001);
 
-    // Warmup
     var w: usize = 0;
     while (w < BENCH_WARMUP) : (w += 1) {
         try a.add(&b);
     }
 
-    // Timed
     var timer = try std.time.Timer.start();
     var iter: usize = 0;
     while (iter < BENCH_ITERS) : (iter += 1) {
@@ -85,13 +81,11 @@ fn benchMul(allocator: std.mem.Allocator) !BenchResult {
     try a.fill(1.0);
     try b.fill(1.000001);
 
-    // Warmup
     var w: usize = 0;
     while (w < BENCH_WARMUP) : (w += 1) {
         try a.mul(&b);
     }
 
-    // Timed
     var timer = try std.time.Timer.start();
     var iter: usize = 0;
     while (iter < BENCH_ITERS) : (iter += 1) {
@@ -152,4 +146,3 @@ pub fn main() !void {
 
     std.debug.print("RESULT: PASS\n", .{});
 }
-

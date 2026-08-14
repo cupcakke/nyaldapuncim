@@ -72,10 +72,10 @@ entry master_weights_to_f16_3d [layers][rows][columns] (weights: [layers][rows][
   map (map (map (\value -> f16.f32 (clamp_f16_weight value)))) weights
 
 entry stack_update_sfd_master [layers][rows][columns]
-  (master_weights: *[layers][rows][columns]f32)
+  (master_weights: [layers][rows][columns]f32)
   (gradients: [layers][rows][columns]f32)
-  (momentum_state: *[layers][rows][columns]f32)
-  (fisher_state: *[layers][rows][columns]f32)
+  (momentum_state: [layers][rows][columns]f32)
+  (fisher_state: [layers][rows][columns]f32)
   (learning_rate: f32)
   (momentum_beta: f32)
   (fisher_gamma: f32)
@@ -95,12 +95,12 @@ entry master_weights_to_f16_2d [rows][columns] (weights: [rows][columns]f32): *[
   map (map (\value -> f16.f32 (clamp_f16_weight value))) weights
 
 entry embedding_update_sfd_master [vocab_size][dim]
-  (master_weight: *[vocab_size][dim]f32) (grad_weight: [vocab_size][dim]f32)
-  (momentum_state: *[vocab_size][dim]f32) (fisher_state: *[vocab_size][dim]f32)
+  (master_weight: [vocab_size][dim]f32) (grad_weight: [vocab_size][dim]f32)
+  (momentum_state: [vocab_size][dim]f32) (fisher_state: [vocab_size][dim]f32)
   (learning_rate: f32) (momentum_beta: f32) (fisher_gamma: f32) (optimizer_step: i64) (epsilon: f32)
   (trust_ratio: f32) (weight_floor: f32)
   : ([vocab_size][dim]f32, [vocab_size][dim]f32, [vocab_size][dim]f32) =
-  in sfd_fisher_update_core master_weight grad_weight momentum_state fisher_state learning_rate momentum_beta fisher_gamma optimizer_step epsilon trust_ratio weight_floor
+  sfd_fisher_update_core master_weight grad_weight momentum_state fisher_state learning_rate momentum_beta fisher_gamma optimizer_step epsilon trust_ratio weight_floor
 
 entry scale_matrix_f32 [rows][columns] (values: *[rows][columns]f32) (scale_factor: f32) : *[rows][columns]f32 =
   map (map (\value -> value * scale_factor)) values
@@ -193,7 +193,7 @@ let spectral_normalize_matrix [rows][columns]
   in (normalized, sigma, sigma * scale)
 
 entry stack_spectral_normalize [layers][rows][columns]
-  (weights: *[layers][rows][columns]f32)
+  (weights: [layers][rows][columns]f32)
   (target: f32)
   (power_iters: i64)
   : (*[layers][rows][columns]f32, f32, f32) =
@@ -204,14 +204,14 @@ entry stack_spectral_normalize [layers][rows][columns]
   in (normalized, before, after)
 
 entry embedding_spectral_normalize [vocab_size][dim]
-  (weight: *[vocab_size][dim]f32)
-  (u: *[vocab_size]f32)
-  (v: *[dim]f32)
+  (weight: [vocab_size][dim]f32)
+  (u: [vocab_size]f32)
+  (v: [dim]f32)
   (power_iters: i64)
   (target: f32) : (*[vocab_size][dim]f32, *[vocab_size]f32, *[dim]f32, f32, f32) =
   let weight_t = transpose weight
   let (final_u, final_v) =
-    loop (ua, _va) = (u, v) for loop_k < i64.max 1 power_iters do
+    loop (ua, _va) = (copy u, copy v) for loop_k < i64.max 1 power_iters do
       let _ = loop_k
       let raw_v = map (\column -> f32.sum (map2 (*) column ua)) weight_t
       let v_norm = f32.sqrt (f32.sum (map (\value -> value * value) raw_v))
@@ -338,8 +338,8 @@ entry rsf_stack_backward_gradients_fused [batch_size][seq_len][half][num_layers]
   (targets: [batch_size][seq_len][half*2]f16)
   (originals: [batch_size][seq_len][half*2]f16)
   (lengths: [batch_size]i64)
-  (weights_s: *[num_layers][half][half+1]f16)
-  (weights_t: *[num_layers][half][half+1]f16)
+  (weights_s: [num_layers][half][half+1]f16)
+  (weights_t: [num_layers][half][half+1]f16)
   (grad_mean: bool)
   (gradient_scale: f32)
   (clip_min: f32)

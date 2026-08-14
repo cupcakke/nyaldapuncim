@@ -16,18 +16,12 @@ pub const IoConfig = struct {
     pub const MAX_PATH_LEN: usize = 4096;
 };
 
-/// Opens a path independently of whether the caller supplied an absolute or
-/// working-directory-relative path.  Zig's `cwd()` directory handles only
-/// relative paths, so serialization APIs must dispatch explicitly.
 pub fn openFilePath(path: []const u8, flags: fs.File.OpenFlags) !fs.File {
     if (path.len == 0) return error.InvalidPath;
     if (fs.path.isAbsolute(path)) return fs.openFileAbsolute(path, flags);
     return fs.cwd().openFile(path, flags);
 }
 
-/// Creates or truncates a path independently of whether it is absolute or
-/// working-directory-relative.  Parent directories are deliberately not
-/// created here: callers retain control over persistence layout and errors.
 pub fn createFilePath(path: []const u8, flags: fs.File.CreateFlags) !fs.File {
     if (path.len == 0) return error.InvalidPath;
     if (fs.path.isAbsolute(path)) return fs.createFileAbsolute(path, flags);
@@ -40,9 +34,6 @@ pub fn deleteFilePath(path: []const u8) !void {
     return fs.cwd().deleteFile(path);
 }
 
-/// Renaming requires both paths to be rooted in the same directory namespace.
-/// This helper supports absolute-to-absolute and relative-to-relative moves;
-/// mixed forms are rejected instead of silently resolving the wrong target.
 pub fn renameFilePath(old_path: []const u8, new_path: []const u8) !void {
     if (old_path.len == 0 or new_path.len == 0) return error.InvalidPath;
     const old_is_absolute = fs.path.isAbsolute(old_path);

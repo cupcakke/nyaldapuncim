@@ -535,7 +535,35 @@ test "LearnedEmbedding batched backward accumulates only valid lengths" {
     emb.zeroGrad();
     emb.backwardAccumulate(&tokens, &lengths, grad, 4, 2);
 
-    try std.testing.expectApproxEqAbs(@as(f32, 4.0), emb.grad.data[1 * 4 + 0], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 4.0), emb.grad.data[3 * 4 + 0], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), emb.grad.data[0], 1e-6);
+    var column: usize = 0;
+    while (column < 4) : (column += 1) {
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), emb.grad.data[1 * 4 + column], 1e-6);
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), emb.grad.data[2 * 4 + column], 1e-6);
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), emb.grad.data[3 * 4 + column], 1e-6);
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), emb.grad.data[4 * 4 + column], 1e-6);
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), emb.grad.data[5 * 4 + column], 1e-6);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.0), emb.grad.data[0 * 4 + column], 1e-6);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.0), emb.grad.data[6 * 4 + column], 1e-6);
+    }
+}
+
+test "LearnedEmbedding batched backward accumulates repeated tokens additively" {
+    const allocator = std.testing.allocator;
+    var emb = try LearnedEmbedding.init(allocator, 8, 2, 7);
+    defer emb.deinit();
+
+    const tokens = [_]u32{ 3, 3, 3, 0 };
+    const lengths = [_]u32{3};
+    const grad = try allocator.alloc(f32, tokens.len * @as(usize, 2));
+    defer allocator.free(grad);
+    var i: usize = 0;
+    while (i < grad.len) : (i += 1) grad[i] = 0.5;
+
+    emb.zeroGrad();
+    emb.backwardAccumulate(&tokens, &lengths, grad, 4, 1);
+
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), emb.grad.data[3 * 2 + 0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), emb.grad.data[3 * 2 + 1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), emb.grad.data[0 * 2 + 0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), emb.grad.data[0 * 2 + 1], 1e-6);
 }

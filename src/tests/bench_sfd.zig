@@ -4,30 +4,20 @@ const core = deps.core_tensor;
 const Tensor = deps.sfd.Tensor;
 const SpectralNormalizer = deps.sfd.SpectralNormalizer;
 
-// FP4 quantization constants
-const QUANT_N: usize = 1 << 20; // 1M values
+const QUANT_N: usize = 1 << 20;
 const QUANT_ITERS: usize = 100;
 
-// Spectral normalizer constants
 const WEIGHT_DIM: usize = 512;
 const SPECTRAL_ITERS: usize = 50;
 const POWER_ITERS_FULL: usize = 20;
 const POWER_ITERS_SPARSE: usize = 5;
 
-// FP4 quantization logic (replicated from sfd.zig since quantizeValue is private)
 fn quantizeFP4(value: f32) f32 {
     if (!std.math.isFinite(value)) return value;
     const clamped = std.math.clamp(value, -6.0, 6.0);
     const abs_v = if (clamped < 0) -clamped else clamped;
     const sign: f32 = if (clamped < 0) -1.0 else 1.0;
-    const best: f32 = if (abs_v < 0.25) 0.0
-        else if (abs_v < 0.75) 0.5
-        else if (abs_v < 1.25) 1.0
-        else if (abs_v < 1.75) 1.5
-        else if (abs_v < 2.5) 2.0
-        else if (abs_v < 3.5) 3.0
-        else if (abs_v < 5.0) 4.0
-        else 6.0;
+    const best: f32 = if (abs_v < 0.25) 0.0 else if (abs_v < 0.75) 0.5 else if (abs_v < 1.25) 1.0 else if (abs_v < 1.75) 1.5 else if (abs_v < 2.5) 2.0 else if (abs_v < 3.5) 3.0 else if (abs_v < 5.0) 4.0 else 6.0;
     return sign * best;
 }
 
@@ -49,7 +39,6 @@ pub fn main() !void {
     std.debug.print("BENCHMARK: SFD Optimizations (FP4 quantization + SpectralNorm)\n", .{});
     std.debug.print("================================================================================\n", .{});
 
-    // --- FP4 quantization benchmark ---
     {
         std.debug.print("Config: quant_n={d}, iters={d}\n", .{ QUANT_N, QUANT_ITERS });
         std.debug.print("--------------------------------------------------------------------------------\n", .{});
@@ -59,14 +48,12 @@ pub fn main() !void {
         const output = try allocator.alloc(f32, QUANT_N);
         defer allocator.free(output);
 
-        // Fill with linearly spaced values from -6.0 to 6.0
         var i: usize = 0;
         while (i < QUANT_N) : (i += 1) {
             const t_val: f32 = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(QUANT_N - 1));
             input[i] = -6.0 + 12.0 * t_val;
         }
 
-        // Timed
         var timer = try std.time.Timer.start();
         var iter: usize = 0;
         while (iter < QUANT_ITERS) : (iter += 1) {
@@ -88,25 +75,21 @@ pub fn main() !void {
         std.debug.print("--------------------------------------------------------------------------------\n", .{});
     }
 
-    // --- SpectralNormalizer benchmark ---
     {
         std.debug.print("Config: weight_dim={d}, iters={d}, power_iters_full={d}, power_iters_sparse={d}\n", .{ WEIGHT_DIM, SPECTRAL_ITERS, POWER_ITERS_FULL, POWER_ITERS_SPARSE });
         std.debug.print("--------------------------------------------------------------------------------\n", .{});
 
         const dims = [_]usize{ WEIGHT_DIM, WEIGHT_DIM };
 
-        // Fill with deterministic pseudo-random values
         var prng = std.Random.DefaultPrng.init(42);
         const random = prng.random();
 
-        // Save initial values for reset
         const initial_data = try allocator.alloc(f32, WEIGHT_DIM * WEIGHT_DIM);
         defer allocator.free(initial_data);
         for (initial_data) |*v| {
             v.* = random.float(f32) * 2.0 - 1.0;
         }
 
-        // Benchmark with full power iterations
         var weights_full = try Tensor.init(allocator, &dims);
         defer weights_full.deinit();
 
@@ -127,7 +110,6 @@ pub fn main() !void {
         std.debug.print("  Per iteration:     {d:.2} ms\n", .{full_per_iter});
         std.debug.print("--------------------------------------------------------------------------------\n", .{});
 
-        // Benchmark with sparse power iterations
         var weights_sparse = try Tensor.init(allocator, &dims);
         defer weights_sparse.deinit();
 
@@ -155,4 +137,3 @@ pub fn main() !void {
 
     std.debug.print("RESULT: PASS\n", .{});
 }
-

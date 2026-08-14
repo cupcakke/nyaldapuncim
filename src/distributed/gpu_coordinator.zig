@@ -112,10 +112,6 @@ pub const GPUCoordinator = struct {
 
         try checkCuda(nccl.cudaSetDevice(device_id), "cudaSetDevice", error.CudaSetDeviceFailed);
 
-        // Single-GPU mode: skip ncclCommInitRank entirely when world_size==1.
-        // ncclCommInitRank probes the network stack (InfiniBand, shared memory,
-        // etc.) even for a single rank, producing warnings and wasting ~0.5 s.
-        // For world_size>1 we still initialize NCCL normally.
         var nccl_comm_opt: ?*nccl.ncclComm = null;
         if (world_size > 1) {
             var nccl_comm_local: *nccl.ncclComm = undefined;
@@ -245,8 +241,6 @@ pub const GPUCoordinator = struct {
         if (count == 0) {
             return;
         }
-        // For world_size==1 the local value is already the global value.
-        // Copy send→recv in case the caller passed distinct buffers, then return.
         if (self.world_size == 1) {
             if (send_buf != recv_buf) {
                 const elem_bytes: usize = switch (dtype) {
