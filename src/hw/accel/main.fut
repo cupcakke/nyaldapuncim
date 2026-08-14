@@ -102,11 +102,11 @@ entry embedding_update_sfd_master [vocab_size][dim]
   : ([vocab_size][dim]f32, [vocab_size][dim]f32, [vocab_size][dim]f32) =
   sfd_fisher_update_core master_weight grad_weight momentum_state fisher_state learning_rate momentum_beta fisher_gamma optimizer_step epsilon trust_ratio weight_floor
 
-entry scale_matrix_f32 [rows][columns] (values: *[rows][columns]f32) (scale_factor: f32) : *[rows][columns]f32 =
+entry scale_matrix_f32 [rows][columns] (values: [rows][columns]f32) (scale_factor: f32) : *[rows][columns]f32 =
   map (map (\value -> value * scale_factor)) values
 
 entry clip_matrix_global_norm_f32 [rows][columns]
-  (values: *[rows][columns]f32) (clip_norm: f32) : *[rows][columns]f32 =
+  (values: [rows][columns]f32) (clip_norm: f32) : *[rows][columns]f32 =
   let flat_values = flatten values
   let maximum_absolute_value = reduce f32.max 0f32 (map f32.abs flat_values)
   let scaled_norm_squared =
