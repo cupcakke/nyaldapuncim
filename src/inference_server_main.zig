@@ -72,9 +72,6 @@ pub fn main() !void {
     if (config.model_path) |path| {
         server.loadModel(path) catch |err| {
             std.debug.print("Failed to load model from {s}: {}\n", .{ path, err });
-            // A configured model is an explicit startup contract.  Continuing
-            // with an unloaded server makes health checks look successful while
-            // every inference request returns 503.
             return err;
         };
     }
@@ -84,4 +81,3 @@ pub fn main() !void {
         return err;
     };
 }
-

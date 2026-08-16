@@ -99,15 +99,42 @@ pub const ModelMetadata = struct {
         const mgt_vocab_val = obj.get("mgt_vocab_size") orelse return ModelError.InvalidMetadata;
         const description_val = obj.get("description") orelse return ModelError.InvalidMetadata;
 
-        const model_name = switch (model_name_val) { .string => |s| s, else => return ModelError.InvalidMetadata };
-        const version = switch (version_val) { .integer => |i| if (i >= 0 and i <= std.math.maxInt(u32)) @as(u32, @intCast(i)) else return ModelError.InvalidMetadata, else => return ModelError.InvalidMetadata };
-        const created = switch (created_val) { .integer => |i| i, else => return ModelError.InvalidMetadata };
-        const rsf_layers_raw = switch (rsf_layers_val) { .integer => |i| if (i >= 0 and i <= std.math.maxInt(usize)) i else return ModelError.InvalidMetadata, else => return ModelError.InvalidMetadata };
-        const rsf_dim_raw = switch (rsf_dim_val) { .integer => |i| if (i >= 0 and i <= std.math.maxInt(usize)) i else return ModelError.InvalidMetadata, else => return ModelError.InvalidMetadata };
-        const ranker_ngrams_raw = switch (ranker_ngrams_val) { .integer => |i| if (i >= 0 and i <= std.math.maxInt(usize)) i else return ModelError.InvalidMetadata, else => return ModelError.InvalidMetadata };
-        const ranker_lsh_raw = switch (ranker_lsh_val) { .integer => |i| if (i >= 0 and i <= std.math.maxInt(usize)) i else return ModelError.InvalidMetadata, else => return ModelError.InvalidMetadata };
-        const mgt_vocab_raw = switch (mgt_vocab_val) { .integer => |i| if (i >= 0 and i <= std.math.maxInt(usize)) i else return ModelError.InvalidMetadata, else => return ModelError.InvalidMetadata };
-        const description = switch (description_val) { .string => |s| s, else => return ModelError.InvalidMetadata };
+        const model_name = switch (model_name_val) {
+            .string => |s| s,
+            else => return ModelError.InvalidMetadata,
+        };
+        const version = switch (version_val) {
+            .integer => |i| if (i >= 0 and i <= std.math.maxInt(u32)) @as(u32, @intCast(i)) else return ModelError.InvalidMetadata,
+            else => return ModelError.InvalidMetadata,
+        };
+        const created = switch (created_val) {
+            .integer => |i| i,
+            else => return ModelError.InvalidMetadata,
+        };
+        const rsf_layers_raw = switch (rsf_layers_val) {
+            .integer => |i| if (i >= 0 and i <= std.math.maxInt(usize)) i else return ModelError.InvalidMetadata,
+            else => return ModelError.InvalidMetadata,
+        };
+        const rsf_dim_raw = switch (rsf_dim_val) {
+            .integer => |i| if (i >= 0 and i <= std.math.maxInt(usize)) i else return ModelError.InvalidMetadata,
+            else => return ModelError.InvalidMetadata,
+        };
+        const ranker_ngrams_raw = switch (ranker_ngrams_val) {
+            .integer => |i| if (i >= 0 and i <= std.math.maxInt(usize)) i else return ModelError.InvalidMetadata,
+            else => return ModelError.InvalidMetadata,
+        };
+        const ranker_lsh_raw = switch (ranker_lsh_val) {
+            .integer => |i| if (i >= 0 and i <= std.math.maxInt(usize)) i else return ModelError.InvalidMetadata,
+            else => return ModelError.InvalidMetadata,
+        };
+        const mgt_vocab_raw = switch (mgt_vocab_val) {
+            .integer => |i| if (i >= 0 and i <= std.math.maxInt(usize)) i else return ModelError.InvalidMetadata,
+            else => return ModelError.InvalidMetadata,
+        };
+        const description = switch (description_val) {
+            .string => |s| s,
+            else => return ModelError.InvalidMetadata,
+        };
 
         const model_name_duped = try allocator.dupe(u8, model_name);
         errdefer allocator.free(model_name_duped);
@@ -698,7 +725,6 @@ pub fn loadSFDState(optimizer: *sfd.SFD, path: []const u8) !void {
     try optimizer.loadState(path);
 }
 
-// deprecated: use inline checkpoint serialization in distributed_trainer_futhark.zig
 pub fn saveNSIRGraph(graph: *nsir.SelfSimilarRelationalGraph, path: []const u8) !void {
     var file = try fs.cwd().createFile(path, .{});
     defer file.close();
@@ -749,7 +775,6 @@ pub fn saveNSIRGraph(graph: *nsir.SelfSimilarRelationalGraph, path: []const u8) 
     try buffered.flush();
 }
 
-// deprecated: use inline checkpoint serialization in distributed_trainer_futhark.zig
 pub fn loadNSIRGraph(graph: *nsir.SelfSimilarRelationalGraph, path: []const u8, allocator: Allocator) !void {
     const file = try fs.cwd().openFile(path, .{});
     defer file.close();
@@ -861,4 +886,3 @@ test "Metadata JSON serialization" {
     try testing.expectEqual(metadata.created_timestamp, parsed_metadata.created_timestamp);
     try testing.expectEqual(metadata.rsf_layers, parsed_metadata.rsf_layers);
 }
-

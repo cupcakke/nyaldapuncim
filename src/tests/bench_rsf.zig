@@ -51,15 +51,12 @@ pub fn main() !void {
     var grad_input = try Tensor.init(allocator, &input_shape);
     defer grad_input.deinit();
 
-    // --- Forward benchmark ---
-    // Warmup
     var w: usize = 0;
     while (w < BENCH_WARMUP) : (w += 1) {
         @memcpy(y.data[0..y.shape.totalSize()], x.data[0..x.shape.totalSize()]);
         try model.forward(&y);
     }
 
-    // Timed
     var fwd_timer = try std.time.Timer.start();
     var iter: usize = 0;
     while (iter < BENCH_ITERS) : (iter += 1) {
@@ -80,18 +77,14 @@ pub fn main() !void {
     std.debug.print("  ms per batch:      {d:.2} ms\n", .{fwd_per_iter});
     std.debug.print("--------------------------------------------------------------------------------\n", .{});
 
-    // --- Backward benchmark ---
-    // Prepare valid forward output
     @memcpy(y.data[0..y.shape.totalSize()], x.data[0..x.shape.totalSize()]);
     try model.forward(&y);
 
-    // Warmup
     w = 0;
     while (w < BENCH_WARMUP) : (w += 1) {
         try model.backward(&grad_output, &x, &y, &grad_input);
     }
 
-    // Timed
     var bwd_timer = try std.time.Timer.start();
     iter = 0;
     while (iter < BENCH_ITERS) : (iter += 1) {
@@ -121,4 +114,3 @@ pub fn main() !void {
         std.debug.print("RESULT: FAIL (invertibility check failed)\n", .{});
     }
 }
-
