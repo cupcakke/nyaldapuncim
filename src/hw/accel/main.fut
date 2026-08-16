@@ -100,7 +100,7 @@ entry embedding_update_sfd_master [vocab_size][dim]
   (learning_rate: f32) (momentum_beta: f32) (fisher_gamma: f32) (optimizer_step: i64) (epsilon: f32)
   (trust_ratio: f32) (weight_floor: f32)
   : ([vocab_size][dim]f32, [vocab_size][dim]f32, [vocab_size][dim]f32) =
-  in sfd_fisher_update_core master_weight grad_weight momentum_state fisher_state learning_rate momentum_beta fisher_gamma optimizer_step epsilon trust_ratio weight_floor
+  sfd_fisher_update_core master_weight grad_weight momentum_state fisher_state learning_rate momentum_beta fisher_gamma optimizer_step epsilon trust_ratio weight_floor
 
 entry scale_matrix_f32 [rows][columns] (values: *[rows][columns]f32) (scale_factor: f32) : *[rows][columns]f32 =
   map (map (\value -> value * scale_factor)) values
@@ -130,7 +130,10 @@ entry embedding_forward_padded [n][batch_size][seq_len][vocab_size][dim]
   map2 (\batch_index length ->
     map (\sequence_index ->
       let flat_index = batch_index * seq_len + sequence_index
-      in if sequence_index < i64.max 0 (i64.min seq_len length) && flat_index < n
+      in if sequence_index >= 0 &&
+            sequence_index < i64.max 0 (i64.min seq_len length) &&
+            flat_index >= 0 &&
+            flat_index < n
          then let token = tokens[flat_index]
               let safe_token = if token >= 0 && token < vocab_size then token else 0
               in weight[safe_token]
@@ -170,7 +173,7 @@ let spectral_normalize_matrix [rows][columns]
   (target: f32)
   (power_iters: i64)
   : ([rows][columns]f32, f32, f32) =
-  let initial_value = 1f32 / f32.sqrt (f32.i64 columns)
+  let initial_value = if columns > 0 then 1f32 / f32.sqrt (f32.i64 columns) else 0f32
   let initial_v = replicate columns initial_value
   let weight_t = transpose weight
   let (final_u, final_v) =
@@ -381,7 +384,7 @@ entry rsf_stack_backward_gradients_fused [batch_size][seq_len][half][num_layers]
        replicate num_layers (copy gs_zero),
        y_start,
        initial_grads,
-       replicate valid_tokens 0f32)
+       map (\_ -> 0f32) y_start)
     for i < num_layers do
       let l = num_layers - 1 - i
       let ws = copy weights_s[l]
@@ -460,7 +463,7 @@ entry rsf_stack_backward_gradients_fused [batch_size][seq_len][half][num_layers]
       let combined = base + reconstruction_alpha * 2f32 * safe_diff / gradient_element_divisor
       in f16.f32 (f32.max (-65504f32) (f32.min 65504f32 combined))) g_row x_row o_row
     ) g_stack x_stack active_orig
-  let zero_delta = replicate (batch_size * seq_len) (replicate d2 0f16)
+  let zero_delta = replicate (batch_size * seq_len) (replicate (half * 2) 0f16)
   let input_delta = scatter zero_delta active_indices active_input_delta
   let input_delta_3d = unflatten input_delta :> [batch_size][seq_len][half*2]f16
   in (copy gs_normalized, copy gt_normalized, input_delta_3d,
